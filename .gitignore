@@ -1,0 +1,16 @@
+# Godot 4+ engine cache (regenerated on open)
+.godot/
+
+# Export / build output
+/build/
+/dist/
+*.zip
+
+# Large CC0 source kit — gdignore'd, not imported by Godot, re-downloadable from Kenney.
+# Only assets/ships/ (the curated subset actually used) is tracked.
+/assets/kenney_space_kit/
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store

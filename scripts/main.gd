@@ -1,0 +1,4710 @@
+extends Node3D
+
+# ============================================================
+# STERNENFLUCHT — 3D Side-View Twin-Stick Roguelike
+# Uses Kenney Space Kit (CC0) ship models for the base craft +
+# upgrade attachments (turrets, sensors, fins, etc.).
+# ============================================================
+
+const MODEL_PLAYER_BASE   := preload("res://assets/ships/craft_racer.glb")
+const MODEL_TURRET_SINGLE := preload("res://assets/ships/turret_single.glb")
+const MODEL_TURRET_DOUBLE := preload("res://assets/ships/turret_double.glb")
+const MODEL_WEAPON_GUN    := preload("res://assets/ships/weapon_gun.glb")
+const MODEL_SAT_DISH      := preload("res://assets/ships/satelliteDish.glb")
+const MODEL_SAT_DISH_DET  := preload("res://assets/ships/satelliteDish_detailed.glb")
+const MODEL_FINS_A        := preload("res://assets/ships/rocket_finsA.glb")
+const MODEL_NOSE          := preload("res://assets/ships/rocket_topA.glb")
+const MODEL_BARRELS       := preload("res://assets/ships/barrels.glb")
+
+# Kenney models face -Z; we want +X forward → rotate Y by -90°
+const MODEL_FACING := Vector3(0, -90, 0)
+
+# Arena (in world units)
+const ARENA_W := 36.0
+const ARENA_H := 20.0
+const ARENA_PAD := 1.2
+
+# Player base
+const P_SPEED := 11.0
+const P_HP := 100
+const P_RADIUS := 0.55
+const P_FIRE_RATE := 0.55
+const P_RANGE := 18.0
+const P_PICKUP_RANGE := 4.0
+const P_INVULN := 0.6
+
+# Projectile
+const PROJ_SPEED := 28.0
+const PROJ_LIFETIME := 0.65  # tuned so PROJ_SPEED * PROJ_LIFETIME ≈ P_RANGE (≤ on-screen distance)
+const PROJ_RADIUS := 0.18
+
+# XP
+const XP_BASE := 4
+const XP_INC := 3
+
+# Spawn
+const SPAWN_RING := 22.0
+const SHIP_SCALE_BASE := 1.9
+const CAM_OFFSET_BASE := Vector3(0, -10.0, 13.0)
+const FIRE_CONE_DEG := 36.0  # half-angle of the cone in front of the ship within which auto-fire works
+const MAX_ENEMIES := 60
+
+# Wave
+const WAVE_DURATION := 28.0
+const BOSS_EVERY := 5
+
+# States
+const STATE_PLAYING := 0
+const STATE_LEVELUP := 1
+const STATE_GAMEOVER := 2
+
+# Colors
+const COL_TEXT := Color(0.95, 0.97, 1.0)
+const COL_DIM := Color(0.6, 0.7, 0.85)
+const COL_PLAYER := Color(0.55, 0.95, 1.0)
+const COL_PLAYER_EMIT := Color(0.25, 0.7, 1.0)
+const COL_DRONE := Color(0.92, 0.42, 0.32)
+const COL_SHOOTER := Color(1.0, 0.7, 0.25)
+const COL_TANK := Color(0.85, 0.35, 0.7)
+const COL_BOSS := Color(1.0, 0.4, 0.95)
+const COL_PROJ := Color(0.7, 1.0, 0.95)
+const COL_LASER_CORE := Color(1.0, 0.85, 0.78)
+const COL_LASER := Color(1.0, 0.22, 0.15)
+const COL_E_BULLET := Color(1.0, 0.55, 0.35)
+const COL_XP := Color(0.55, 1.0, 0.55)
+
+# ============================================================
+# Entity
+# ============================================================
+
+class Entity:
+	var pos: Vector3 = Vector3.ZERO
+	var vel: Vector3 = Vector3.ZERO
+	var radius: float = 0.5
+	var hp: int = 1
+	var max_hp: int = 1
+	var dead: bool = false
+	var type: String = ""
+	var color: Color = Color.WHITE
+	var damage: int = 0
+	var lifetime: float = 0.0
+	var shoot_cd: float = 2.0
+	var shoot_timer: float = 0.0
+	var value: int = 0
+	var pulse: float = 0.0
+	var pierce: int = 0
+	var hit_flash: float = 0.0
+	var node: Node3D = null   # the visual MeshInstance3D / Node3D in the scene
+
+# Radar mini-map — bottom-right HUD overlay. Sci-fi style with a rotating
+# sweep beam that brightens contacts as it passes over them, soft glow halos
+# on every blip, rim ticks every 45°, and off-screen contacts pinned to the
+# rim. Holds a back-reference to the main script to sample game state.
+class RadarPanel extends Control:
+	var main: Node = null
+	var radius_pixels: float = 62.0
+	var world_range: float = 80.0
+	var sweep_angle: float = 0.0
+	var sweep_speed: float = TAU / 3.2  # one revolution per ~3.2s
+
+	func _process(delta: float) -> void:
+		sweep_angle = fmod(sweep_angle + delta * sweep_speed, TAU)
+		queue_redraw()
+
+	# Soft round glow — three stacked circles of decreasing radius / increasing alpha
+	func _draw_blip(at: Vector2, base_col: Color, size: float, intensity: float) -> void:
+		var glow: Color = Color(base_col.r, base_col.g, base_col.b, 0.18 * intensity)
+		draw_circle(at, size * 2.6, glow)
+		glow.a = 0.35 * intensity
+		draw_circle(at, size * 1.6, glow)
+		var core: Color = base_col
+		core.a = clamp(0.85 + intensity * 0.15, 0.0, 1.0)
+		draw_circle(at, size, core)
+
+	# Sweep brightness for a contact at the given radar-space angle. Peaks when
+	# the sweep beam aligns, fades quickly behind it.
+	func _sweep_intensity(blip_angle: float) -> float:
+		# Difference modded into [-PI, PI]
+		var diff: float = fmod(blip_angle - sweep_angle + PI, TAU)
+		if diff < 0.0:
+			diff += TAU
+		diff -= PI
+		# Positive diff = the beam already passed this blip (trail)
+		# Negative diff = beam still approaches (no glow yet)
+		if diff < 0.0 or diff > 0.6:
+			return 0.0
+		return 1.0 - diff / 0.6  # linear fade across ~34°
+
+	func _draw() -> void:
+		if main == null:
+			return
+		var c := Vector2(radius_pixels, radius_pixels)
+		var r: float = radius_pixels
+
+		# Outer glow ring (2 layers)
+		draw_circle(c, r + 6.0, Color(0.25, 0.7, 1.0, 0.08))
+		draw_circle(c, r + 3.0, Color(0.25, 0.7, 1.0, 0.18))
+		# Disc body with subtle vignette via inner darker disc
+		draw_circle(c, r, Color(0.03, 0.06, 0.10, 0.92))
+		draw_circle(c, r * 0.5, Color(0.04, 0.08, 0.14, 0.4))
+		# Bezel ring (sharp outline)
+		draw_arc(c, r, 0.0, TAU, 96, Color(0.35, 0.75, 1.0, 0.85), 1.6, true)
+
+		# Concentric guide rings
+		for r_frac in [0.25, 0.5, 0.75]:
+			draw_arc(c, r * r_frac, 0.0, TAU, 64,
+				Color(0.3, 0.7, 0.95, 0.14), 1.0, true)
+
+		# Radial spokes every 45°
+		for i in 8:
+			var a: float = float(i) * (TAU / 8.0)
+			draw_line(c, c + Vector2(cos(a), sin(a)) * r,
+				Color(0.3, 0.7, 0.95, 0.10), 1.0)
+		# Rim tick marks every 30° — slightly brighter at cardinals
+		for i in 12:
+			var a2: float = float(i) * (TAU / 12.0)
+			var inner: Vector2 = c + Vector2(cos(a2), sin(a2)) * (r - 4.0)
+			var outer: Vector2 = c + Vector2(cos(a2), sin(a2)) * r
+			var col: Color = Color(0.4, 0.85, 1.0, 0.45 if i % 3 == 0 else 0.22)
+			draw_line(inner, outer, col, 1.0 if i % 3 == 0 else 0.8)
+
+		# Rotating sweep wedge — bright leading line + fading trail
+		var lead: Vector2 = c + Vector2(cos(sweep_angle), sin(sweep_angle)) * r
+		draw_line(c, lead, Color(0.55, 0.95, 1.0, 0.85), 1.4)
+		var trail_arc: float = 0.6
+		var n_pts: int = 14
+		var pts := PackedVector2Array()
+		var cols := PackedColorArray()
+		pts.append(c)
+		cols.append(Color(0.3, 0.85, 1.0, 0.25))
+		for i in n_pts:
+			var t: float = float(i) / float(n_pts - 1)
+			var ang: float = sweep_angle - t * trail_arc
+			pts.append(c + Vector2(cos(ang), sin(ang)) * r)
+			cols.append(Color(0.4, 0.85, 1.0, 0.32 * (1.0 - t)))
+		draw_polygon(pts, cols)
+
+		var p_pos: Vector3 = main.p_pos
+		var scale_factor: float = r / world_range
+
+		# Gems — small gold dots with subtle halo
+		for g in main.gems:
+			if g.dead:
+				continue
+			var dxy: Vector3 = g.pos - p_pos
+			if dxy.length() > world_range:
+				continue
+			var px: float = r + dxy.x * scale_factor
+			var py: float = r - dxy.y * scale_factor
+			var ang_g: float = atan2(py - r, px - r)
+			var sw_g: float = _sweep_intensity(ang_g)
+			_draw_blip(Vector2(px, py), Color(1.0, 0.85, 0.25), 1.6, 0.6 + sw_g * 0.8)
+
+		# Enemies — color + size by strength tier, sweep-modulated brightness
+		for e in main.enemies:
+			if e.dead:
+				continue
+			var dxy2: Vector3 = e.pos - p_pos
+			var d: float = dxy2.length()
+			var col: Color
+			var sz: float = 3.0
+			match e.type:
+				"drone":
+					col = Color(0.55, 1.0, 0.45); sz = 2.0
+				"shooter":
+					col = Color(1.0, 0.75, 0.35); sz = 2.6
+				"tank":
+					col = Color(1.0, 0.35, 0.35); sz = 3.3
+				"boss":
+					col = Color(1.0, 0.3, 0.95); sz = 4.4
+				_:
+					col = Color(0.85, 0.85, 0.85); sz = 2.5
+			var pt: Vector2
+			var ang_e: float
+			if d <= world_range:
+				pt = Vector2(r + dxy2.x * scale_factor, r - dxy2.y * scale_factor)
+				ang_e = atan2(pt.y - r, pt.x - r)
+				_draw_blip(pt, col, sz, 0.7 + _sweep_intensity(ang_e) * 1.1)
+			else:
+				# Off-radar contacts pinned to the rim — faint but visible
+				var dir2: Vector2 = Vector2(dxy2.x, -dxy2.y).normalized()
+				pt = c + dir2 * (r - 3.0)
+				ang_e = atan2(dir2.y, dir2.x)
+				var fade_col: Color = Color(col.r, col.g, col.b, 0.55)
+				_draw_blip(pt, fade_col, sz * 0.75, 0.4 + _sweep_intensity(ang_e) * 0.6)
+
+		# Player at the centre — bright glowing triangle pointing in p_facing
+		var f: Vector3 = main.p_facing
+		var fv: Vector2 = Vector2(f.x, -f.y).normalized()
+		var rv: Vector2 = Vector2(-fv.y, fv.x)
+		var nose: Vector2 = c + fv * 6.5
+		var lwing: Vector2 = c - fv * 3.5 + rv * 3.5
+		var rwing: Vector2 = c - fv * 3.5 - rv * 3.5
+		# Glow halo
+		draw_circle(c, 6.0, Color(0.4, 0.95, 1.0, 0.25))
+		draw_polygon(PackedVector2Array([nose, lwing, rwing]),
+			PackedColorArray([Color(0.75, 0.97, 1.0)]))
+
+# ============================================================
+# Player state
+# ============================================================
+
+var p_pos := Vector3.ZERO
+var p_vel := Vector3.ZERO
+var p_hp: int = P_HP
+var p_max_hp: int = P_HP
+var p_level: int = 1
+var p_xp: int = 0
+var p_facing: Vector3 = Vector3(1, 0, 0)
+var p_invuln_timer: float = 0.0
+var p_node: Node3D            # yaw root (rotates around world Z)
+var ship_render: Node3D       # tilted -90° around X so airplane frame becomes top-down
+var p_engine_glow: MeshInstance3D
+var p_engine_glow_mat: StandardMaterial3D    # legacy primary reference (starboard)
+var p_engine_mat_port: StandardMaterial3D = null      # port (left) engine material
+var p_engine_mat_starboard: StandardMaterial3D = null # starboard (right) engine material
+var p_pulse_lights: Array = []  # entries: {mat: StandardMaterial3D, base: float, amp: float, freq: float, phase: float}
+var p_boost_flame: Node3D = null            # twin-flame container; scaled/brightened while boosting
+var p_boost_flame_mat: StandardMaterial3D   # shared material for both flames
+var p_cam_fov_base: float = 58.0
+var p_cam_fov_target: float = 58.0
+var p_muzzle_lights: Array = []  # entries: {light: OmniLight3D, flash: MeshInstance3D, mat: StandardMaterial3D, life: float}
+var speedlines_layer: CanvasLayer = null
+var speedlines: Array = []   # entries: {rect: ColorRect, base_x: float, base_y: float, dir: Vector2, speed: float}
+var speedlines_alpha: float = 0.0  # smoothed 0..1 based on whether boost is active
+
+# Upgrade visuals
+var visual_guns: Array = []
+var visual_engines: Array = []
+var visual_armor: Array = []
+var visual_sensors: Array = []
+var visual_pierce: Node3D = null
+var visual_pickup_ring: Node3D = null
+var visual_speed_fins: Array = []
+var visual_damage_core: Node3D = null
+var visual_damage_lvl: int = 0
+
+# Player upgrades
+var u_speed_mult: float = 1.0
+var u_fire_rate_mult: float = 1.0
+var u_damage: int = 12
+var u_projectiles: int = 1
+var u_range_mult: float = 1.0
+var u_pickup_mult: float = 1.0
+var u_spread_deg: float = 14.0
+var u_pierce: int = 0
+
+# Boost (Shift): drains current charge; refills empty→full in BOOST_RECHARGE_TIME.
+# Tank upgrade grows max capacity; Stärke upgrade grows speed multiplier.
+const BOOST_RECHARGE_TIME := 10.0
+const BOOST_DRAIN_RATE := 1.0           # charge units drained per second while boosting
+var u_boost_max: float = 1.0            # max charge — base allows ~1 sec of boost
+var u_boost_strength: float = 1.8       # speed multiplier while boosting
+var boost_charge: float = 1.0           # current charge, starts full
+var boosting: bool = false
+var boost_depleted: bool = false        # latched true when drained to 0, cleared on Shift release
+
+# Entities
+var enemies: Array = []
+var p_bullets: Array = []
+var e_bullets: Array = []
+var gems: Array = []
+
+# Wave / spawn
+var wave: int = 1
+var wave_timer: float = WAVE_DURATION
+var spawn_timer: float = 1.5
+var spawn_interval: float = 1.5
+var fire_timer: float = 0.0
+
+# Camera / shake
+var cam: Camera3D
+var cam_base_pos: Vector3
+var shake_amount: float = 0.0
+var shake_timer: float = 0.0
+
+# Run
+var kills: int = 0
+var run_time: float = 0.0
+var state: int = STATE_PLAYING
+var pause: bool = false
+
+# Containers
+var world: Node3D
+var bg_root: Node3D
+var stars: Array = []   # Node3D references for parallax stars
+var distant_objects: Array = []   # array of dicts: {node, wrap_radius, rot_axis, rot_speed}
+var storm_nebulae: Array = []     # subset of nebulae with lightning that can hit the player
+									# entries: {node, radius, damage, strike_timer, interval_min, interval_max}
+var active_bolts: Array = []      # currently visible lightning bolts: {root, age, lifetime}
+var laser_sfx: AudioStreamPlayer       # primary laser shot sound
+var laser_sfx_echo: AudioStreamPlayer  # quieter slightly-detuned layer for multi-projectile salvos
+var enemy_shot_sfx: AudioStreamPlayer  # deeper / slower thump for enemy projectiles
+var damage_sfx: AudioStreamPlayer      # ship-takes-damage impact + metallic ring
+var engine_sfx: AudioStreamPlayer      # looping engine whoosh, modulated by speed
+var engine_db_smoothed: float = -80.0  # smoothed volume for the engine loop
+var thunder_stream: AudioStream        # shared loop for storm-nebula thunder ambience
+var enemy_hum_stream: AudioStream      # shared loop for tank/boss enemy hum
+var lightning_strike_sfx: AudioStreamPlayer  # sharp crack + boom when a bolt hits
+var radar: Control = null  # mini-map control bottom-right of the HUD
+var boost_sfx: AudioStreamPlayer       # loop while Shift; volume + pitch drop with charge
+var boost_db_smoothed: float = -80.0
+
+# Materials (cached)
+var mat_player: StandardMaterial3D
+var mat_drone: StandardMaterial3D
+var mat_shooter: StandardMaterial3D
+var mat_tank: StandardMaterial3D
+var mat_boss: StandardMaterial3D
+var mat_proj: StandardMaterial3D
+var mat_e_bullet: StandardMaterial3D
+var mat_gem: StandardMaterial3D
+
+# UI
+var hud: CanvasLayer
+var lbl_hp: Label
+var lbl_xp: Label
+var lbl_wave: Label
+var lbl_time: Label
+var lbl_stats: Label
+var lbl_pause: Label
+var bar_hp_fill: ColorRect
+var bar_xp_fill: ColorRect
+var bar_boost_bg: ColorRect
+var bar_boost_fill: ColorRect
+var lbl_boost: Label
+var levelup_panel: Control
+var levelup_buttons: Array = []
+var go_panel: Control
+var go_title: Label
+var go_detail: Label
+
+# ============================================================
+# Lifecycle
+# ============================================================
+
+func _ready() -> void:
+	randomize()
+	_build_environment()
+	_build_camera()
+	_build_lights()
+	_build_materials()
+	_build_world()
+	_build_starfield()
+	_build_audio()
+	_build_distant_objects()
+	_build_player()
+	_build_hud()
+	_build_speedlines()
+	_build_levelup_panel()
+	_build_go_panel()
+	p_hp = p_max_hp
+
+func _build_audio() -> void:
+	# Procedural laser zap — descending frequency, exponential decay envelope.
+	# Generated once at startup; AudioStreamPlayer.max_polyphony lets rapid
+	# shots layer instead of cutting each other off.
+	var stream: AudioStreamWAV = _make_laser_sound()
+	laser_sfx = AudioStreamPlayer.new()
+	laser_sfx.stream = stream
+	laser_sfx.volume_db = -8.0
+	laser_sfx.max_polyphony = 8
+	add_child(laser_sfx)
+	# Subtle detuned echo layer — only triggered on multi-projectile salvos
+	laser_sfx_echo = AudioStreamPlayer.new()
+	laser_sfx_echo.stream = stream
+	laser_sfx_echo.volume_db = -20.0
+	laser_sfx_echo.pitch_scale = 0.88
+	laser_sfx_echo.max_polyphony = 4
+	add_child(laser_sfx_echo)
+	# Enemy projectile sound — deeper, slower, slightly buzzy "thump"
+	enemy_shot_sfx = AudioStreamPlayer.new()
+	enemy_shot_sfx.stream = _make_enemy_shot_sound()
+	enemy_shot_sfx.volume_db = -14.0
+	enemy_shot_sfx.max_polyphony = 12
+	add_child(enemy_shot_sfx)
+	# Player ship damage — noise impact + low thump + metallic ring overtone
+	damage_sfx = AudioStreamPlayer.new()
+	damage_sfx.stream = _make_damage_sound()
+	damage_sfx.volume_db = -14.0
+	damage_sfx.max_polyphony = 3
+	add_child(damage_sfx)
+	# Engine loop — always playing, volume gated by ship speed in _update_player
+	engine_sfx = AudioStreamPlayer.new()
+	engine_sfx.stream = _make_engine_sound()
+	engine_sfx.volume_db = -80.0
+	add_child(engine_sfx)
+	engine_sfx.play()
+	# Shared streams for 3D ambient sources attached to nebulae and enemies
+	thunder_stream = _make_thunder_sound()
+	enemy_hum_stream = _make_enemy_hum_sound()
+	# Lightning strike crack — non-3D since the bolt always lands on the player
+	lightning_strike_sfx = AudioStreamPlayer.new()
+	lightning_strike_sfx.stream = _make_lightning_strike_sound()
+	lightning_strike_sfx.volume_db = -4.0
+	lightning_strike_sfx.max_polyphony = 4
+	add_child(lightning_strike_sfx)
+	# Boost loop — always playing, gated by volume + pitch based on charge level
+	boost_sfx = AudioStreamPlayer.new()
+	boost_sfx.stream = _make_boost_sound()
+	boost_sfx.volume_db = -80.0
+	add_child(boost_sfx)
+	boost_sfx.play()
+
+func _make_laser_sound() -> AudioStreamWAV:
+	var sample_rate: int = 22050
+	var duration: float = 0.18
+	var n_samples: int = int(sample_rate * duration)
+	var data := PackedByteArray()
+	data.resize(n_samples * 2)
+	var phase: float = 0.0
+	for i in n_samples:
+		var t: float = float(i) / float(sample_rate)
+		var freq: float = lerp(1800.0, 350.0, t / duration)
+		phase += TAU * freq / float(sample_rate)
+		var env: float = exp(-t * 9.0) * 0.55
+		# Sine + a touch of square for crispness
+		var sq: float = 1.0 if sin(phase * 0.5) >= 0.0 else -1.0
+		var s: float = (sin(phase) * 0.75 + sq * 0.25) * env
+		var v: int = int(clamp(s * 32767.0, -32767.0, 32767.0))
+		data.encode_s16(i * 2, v)
+	var stream := AudioStreamWAV.new()
+	stream.format = AudioStreamWAV.FORMAT_16_BITS
+	stream.mix_rate = sample_rate
+	stream.stereo = false
+	stream.data = data
+	return stream
+
+func _make_damage_sound() -> AudioStreamWAV:
+	# Three-layer hit: short noise burst (impact), low descending thump (mass),
+	# tuned metallic ring overtone (clang). Conveys "something hit the ship".
+	var sample_rate: int = 22050
+	var duration: float = 0.28
+	var n_samples: int = int(sample_rate * duration)
+	var data := PackedByteArray()
+	data.resize(n_samples * 2)
+	var phase_low: float = 0.0
+	var phase_ring: float = 0.0
+	for i in n_samples:
+		var t: float = float(i) / float(sample_rate)
+		var freq_low: float = lerp(440.0, 220.0, clamp(t / 0.10, 0.0, 1.0))
+		phase_low += TAU * freq_low / float(sample_rate)
+		phase_ring += TAU * 1180.0 / float(sample_rate)
+		var noise_env: float = exp(-t * 70.0)              # very short crack at the start
+		var noise: float = (randf() * 2.0 - 1.0) * noise_env * 0.45
+		var thump: float = sin(phase_low) * exp(-t * 9.5) * 0.55
+		var ring: float = sin(phase_ring) * exp(-t * 6.0) * 0.28
+		var s: float = noise + thump + ring
+		var v: int = int(clamp(s * 32767.0, -32767.0, 32767.0))
+		data.encode_s16(i * 2, v)
+	var stream := AudioStreamWAV.new()
+	stream.format = AudioStreamWAV.FORMAT_16_BITS
+	stream.mix_rate = sample_rate
+	stream.stereo = false
+	stream.data = data
+	return stream
+
+func _make_boost_sound() -> AudioStreamWAV:
+	# Mid-frequency roar (band-pass-ish on noise) + a low bass tone for thrust.
+	# Caller modulates volume_db and pitch_scale to convey remaining charge.
+	var sample_rate: int = 22050
+	var duration: float = 2.0
+	var n_samples: int = int(sample_rate * duration)
+	var data := PackedByteArray()
+	data.resize(n_samples * 2)
+	var lp1: float = 0.0
+	var lp2: float = 0.0
+	var lp_a: float = 0.06    # low-pass for body
+	var lp_a2: float = 0.35   # tighter for the HP differentiation
+	for _i in 500:
+		var n_in: float = randf() * 2.0 - 1.0
+		lp1 += (n_in - lp1) * lp_a
+		lp2 += (lp1 - lp2) * lp_a2
+	var bass_freq: float = round(78.0 * duration) / duration
+	var phase_bass: float = 0.0
+	for i in n_samples:
+		var n_in2: float = randf() * 2.0 - 1.0
+		lp1 += (n_in2 - lp1) * lp_a
+		lp2 += (lp1 - lp2) * lp_a2
+		var roar: float = (lp2 - lp1) * 3.5  # pseudo band-pass via LP difference
+		phase_bass += TAU * bass_freq / float(sample_rate)
+		var bass: float = sin(phase_bass) * 0.18
+		var s: float = roar + bass
+		var v: int = int(clamp(s * 32767.0, -32767.0, 32767.0))
+		data.encode_s16(i * 2, v)
+	var fade_n: int = int(0.13 * float(sample_rate))
+	for i in fade_n:
+		var blend: float = float(i) / float(fade_n)
+		var idx_end: int = (n_samples - fade_n + i) * 2
+		var v_end: float = float(data.decode_s16(idx_end))
+		var v_start: float = float(data.decode_s16(i * 2))
+		data.encode_s16(idx_end, int(lerp(v_end, v_start, blend)))
+	var stream := AudioStreamWAV.new()
+	stream.format = AudioStreamWAV.FORMAT_16_BITS
+	stream.mix_rate = sample_rate
+	stream.stereo = false
+	stream.data = data
+	stream.loop_mode = AudioStreamWAV.LOOP_FORWARD
+	stream.loop_begin = 0
+	stream.loop_end = n_samples
+	return stream
+
+func _make_lightning_strike_sound() -> AudioStreamWAV:
+	# Sharp crack (mid-frequency bandpass-ish noise burst) immediately followed
+	# by a low-frequency boom that decays over ~0.8s.
+	var sample_rate: int = 22050
+	var duration: float = 0.85
+	var n_samples: int = int(sample_rate * duration)
+	var data := PackedByteArray()
+	data.resize(n_samples * 2)
+	# Bandpass-style: HP via running diff on a low-pass result
+	var lp_crack: float = 0.0
+	var lp_crack2: float = 0.0
+	var lp_boom1: float = 0.0
+	var lp_boom2: float = 0.0
+	for i in n_samples:
+		var t: float = float(i) / float(sample_rate)
+		var n_in: float = randf() * 2.0 - 1.0
+		# Crack: highish-passed noise, very short envelope
+		lp_crack += (n_in - lp_crack) * 0.35
+		lp_crack2 += (lp_crack - lp_crack2) * 0.35
+		var hp: float = n_in - lp_crack2
+		var crack_env: float = exp(-t * 40.0)
+		var crack: float = hp * crack_env * 1.2
+		# Boom: deep low-pass noise with longer tail
+		lp_boom1 += (n_in - lp_boom1) * 0.04
+		lp_boom2 += (lp_boom1 - lp_boom2) * 0.04
+		var boom_env: float = exp(-t * 4.5) * (1.0 - exp(-t * 25.0))  # quick attack, slower decay
+		var boom: float = lp_boom2 * 14.0 * boom_env
+		var s: float = crack + boom
+		var v: int = int(clamp(s * 32767.0, -32767.0, 32767.0))
+		data.encode_s16(i * 2, v)
+	var stream := AudioStreamWAV.new()
+	stream.format = AudioStreamWAV.FORMAT_16_BITS
+	stream.mix_rate = sample_rate
+	stream.stereo = false
+	stream.data = data
+	return stream
+
+func _make_thunder_sound() -> AudioStreamWAV:
+	# Deep three-pole low-pass on white noise → distant rumble. Slow volume
+	# undulation makes it sound like rolling thunder rather than steady static.
+	var sample_rate: int = 22050
+	var duration: float = 4.0
+	var n_samples: int = int(sample_rate * duration)
+	var data := PackedByteArray()
+	data.resize(n_samples * 2)
+	var lp1: float = 0.0
+	var lp2: float = 0.0
+	var lp3: float = 0.0
+	var lp_a: float = 0.012
+	for _i in 800:
+		var n_in: float = randf() * 2.0 - 1.0
+		lp1 += (n_in - lp1) * lp_a
+		lp2 += (lp1 - lp2) * lp_a
+		lp3 += (lp2 - lp3) * lp_a
+	for i in n_samples:
+		var n_in2: float = randf() * 2.0 - 1.0
+		lp1 += (n_in2 - lp1) * lp_a
+		lp2 += (lp1 - lp2) * lp_a
+		lp3 += (lp2 - lp3) * lp_a
+		var t: float = float(i) / float(sample_rate)
+		var mod_freq: float = round(0.35 * duration) / duration  # phase-aligned for clean loop
+		var swell: float = 0.4 + 0.6 * (0.5 + 0.5 * sin(TAU * mod_freq * t))
+		var s: float = lp3 * 14.0 * swell
+		var v: int = int(clamp(s * 32767.0, -32767.0, 32767.0))
+		data.encode_s16(i * 2, v)
+	var fade_n: int = int(0.15 * float(sample_rate))
+	for i in fade_n:
+		var blend: float = float(i) / float(fade_n)
+		var idx_end: int = (n_samples - fade_n + i) * 2
+		var v_end: float = float(data.decode_s16(idx_end))
+		var v_start: float = float(data.decode_s16(i * 2))
+		data.encode_s16(idx_end, int(lerp(v_end, v_start, blend)))
+	var stream := AudioStreamWAV.new()
+	stream.format = AudioStreamWAV.FORMAT_16_BITS
+	stream.mix_rate = sample_rate
+	stream.stereo = false
+	stream.data = data
+	stream.loop_mode = AudioStreamWAV.LOOP_FORWARD
+	stream.loop_begin = 0
+	stream.loop_end = n_samples
+	return stream
+
+func _make_enemy_hum_sound() -> AudioStreamWAV:
+	# Low tonal hum with a slight detuned overtone + a touch of filtered noise
+	# for mechanical "whirr". Phase-aligned frequencies for seamless looping.
+	var sample_rate: int = 22050
+	var duration: float = 2.0
+	var n_samples: int = int(sample_rate * duration)
+	var data := PackedByteArray()
+	data.resize(n_samples * 2)
+	var f1: float = round(140.0 * duration) / duration
+	var f2: float = round(213.0 * duration) / duration
+	var lp1: float = 0.0
+	for i in n_samples:
+		var n_in: float = randf() * 2.0 - 1.0
+		lp1 += (n_in - lp1) * 0.1
+		var t: float = float(i) / float(sample_rate)
+		var tone: float = sin(TAU * f1 * t) * 0.18 + sin(TAU * f2 * t) * 0.09
+		var s: float = tone + lp1 * 0.35
+		var v: int = int(clamp(s * 32767.0, -32767.0, 32767.0))
+		data.encode_s16(i * 2, v)
+	var stream := AudioStreamWAV.new()
+	stream.format = AudioStreamWAV.FORMAT_16_BITS
+	stream.mix_rate = sample_rate
+	stream.stereo = false
+	stream.data = data
+	stream.loop_mode = AudioStreamWAV.LOOP_FORWARD
+	stream.loop_begin = 0
+	stream.loop_end = n_samples
+	return stream
+
+func _make_engine_sound() -> AudioStreamWAV:
+	# Low-pass-filtered noise looped seamlessly via end-into-start crossfade.
+	# A slow sin modulator gives the static-y noise some wind-like motion.
+	var sample_rate: int = 22050
+	var duration: float = 3.0
+	var n_samples: int = int(sample_rate * duration)
+	var data := PackedByteArray()
+	data.resize(n_samples * 2)
+	# Two-pole low-pass state — primed by running 500 samples of warmup
+	var lp1: float = 0.0
+	var lp2: float = 0.0
+	var lp_a: float = 0.04
+	var lp_a2: float = 0.12
+	for _i in 500:
+		var n: float = randf() * 2.0 - 1.0
+		lp1 += (n - lp1) * lp_a
+		lp2 += (lp1 - lp2) * lp_a2
+	# Steady drone tones (chosen so an integer number of periods fits in the
+	# loop length → seamless looping without phase jump at the splice).
+	var drone1_freq: float = round(95.0 * duration) / duration
+	var drone2_freq: float = round(143.0 * duration) / duration
+	for i in n_samples:
+		var n2: float = randf() * 2.0 - 1.0
+		lp1 += (n2 - lp1) * lp_a
+		lp2 += (lp1 - lp2) * lp_a2
+		var t: float = float(i) / float(sample_rate)
+		var drone: float = sin(TAU * drone1_freq * t) * 0.18 + sin(TAU * drone2_freq * t) * 0.09
+		var s: float = lp2 * 5.0 + drone
+		var v: int = int(clamp(s * 32767.0, -32767.0, 32767.0))
+		data.encode_s16(i * 2, v)
+	# Crossfade the last 120 ms of the buffer into the first 120 ms so the loop
+	# point doesn't click.
+	var fade_n: int = int(0.12 * float(sample_rate))
+	for i in fade_n:
+		var blend: float = float(i) / float(fade_n)
+		var idx_end: int = (n_samples - fade_n + i) * 2
+		var v_end: float = float(data.decode_s16(idx_end))
+		var v_start: float = float(data.decode_s16(i * 2))
+		var mixed: int = int(lerp(v_end, v_start, blend))
+		data.encode_s16(idx_end, mixed)
+	var stream := AudioStreamWAV.new()
+	stream.format = AudioStreamWAV.FORMAT_16_BITS
+	stream.mix_rate = sample_rate
+	stream.stereo = false
+	stream.data = data
+	stream.loop_mode = AudioStreamWAV.LOOP_FORWARD
+	stream.loop_begin = 0
+	stream.loop_end = n_samples
+	return stream
+
+func _make_enemy_shot_sound() -> AudioStreamWAV:
+	# Deeper "thump" — slower descending pitch, buzzy detune layer, longer tail.
+	var sample_rate: int = 22050
+	var duration: float = 0.24
+	var n_samples: int = int(sample_rate * duration)
+	var data := PackedByteArray()
+	data.resize(n_samples * 2)
+	var phase1: float = 0.0
+	var phase2: float = 0.0
+	for i in n_samples:
+		var t: float = float(i) / float(sample_rate)
+		var freq: float = lerp(560.0, 130.0, t / duration)
+		phase1 += TAU * freq / float(sample_rate)
+		phase2 += TAU * (freq * 1.5) / float(sample_rate)  # detuned harmonic for buzz
+		var env: float = exp(-t * 6.0) * 0.6
+		var s: float = (sin(phase1) * 0.7 + sin(phase2) * 0.3) * env
+		var v: int = int(clamp(s * 32767.0, -32767.0, 32767.0))
+		data.encode_s16(i * 2, v)
+	var stream := AudioStreamWAV.new()
+	stream.format = AudioStreamWAV.FORMAT_16_BITS
+	stream.mix_rate = sample_rate
+	stream.stereo = false
+	stream.data = data
+	return stream
+
+func _process(delta: float) -> void:
+	# Mute all audio while not actively in gameplay (level-up panel, pause, game over).
+	AudioServer.set_bus_mute(0, state != STATE_PLAYING or pause)
+	if state != STATE_PLAYING or pause:
+		_update_ui_text()
+		_animate_background(delta * 0.3)
+		if radar != null:
+			radar.queue_redraw()
+		return
+
+	run_time += delta
+	_update_player(delta)
+	_update_enemies(delta)
+	_update_p_bullets(delta)
+	_update_e_bullets(delta)
+	_update_gems(delta)
+	_update_fire(delta)
+	_update_spawning(delta)
+	_update_wave(delta)
+	_resolve_collisions()
+	_purge_dead()
+	_check_lightning_strikes(delta)
+	_update_shake(delta)
+	_animate_background(delta)
+	_animate_ship_lights(delta)
+	_animate_speedlines(delta)
+	_update_muzzle_flashes(delta)
+	_check_state()
+	_update_ui_text()
+	if radar != null:
+		radar.queue_redraw()
+
+func _unhandled_input(event: InputEvent) -> void:
+	if event.is_action_pressed("pause"):
+		if state == STATE_GAMEOVER:
+			_restart_run()
+			return
+		pause = not pause
+		lbl_pause.visible = pause
+
+# ============================================================
+# Environment / lighting / camera
+# ============================================================
+
+func _build_environment() -> void:
+	var env := Environment.new()
+	# Use a very dim procedural sky so metal has something to reflect
+	var sky_mat := ProceduralSkyMaterial.new()
+	sky_mat.sky_top_color = Color(0.025, 0.04, 0.10)
+	sky_mat.sky_horizon_color = Color(0.06, 0.08, 0.18)
+	sky_mat.sky_curve = 0.15
+	sky_mat.ground_bottom_color = Color(0.01, 0.01, 0.02)
+	sky_mat.ground_horizon_color = Color(0.03, 0.04, 0.08)
+	sky_mat.sun_angle_max = 15.0
+	sky_mat.energy_multiplier = 0.6
+	var sky := Sky.new()
+	sky.sky_material = sky_mat
+	env.sky = sky
+	# Render a flat deep-space colour as the background so no horizon line shows.
+	# The sky itself is still computed and used as reflection / ambient source.
+	env.background_mode = Environment.BG_COLOR
+	env.background_color = Color(0.012, 0.015, 0.03)
+	env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
+	env.ambient_light_energy = 0.45
+	env.ambient_light_sky_contribution = 0.9
+	env.reflected_light_source = Environment.REFLECTION_SOURCE_SKY
+	env.glow_enabled = true
+	env.glow_intensity = 1.1
+	env.glow_strength = 1.15
+	env.glow_bloom = 0.28
+	env.glow_hdr_threshold = 0.85
+	env.glow_blend_mode = Environment.GLOW_BLEND_MODE_ADDITIVE
+	env.tonemap_mode = Environment.TONE_MAPPER_ACES
+	env.tonemap_exposure = 1.0
+	env.tonemap_white = 6.5
+	env.ssao_enabled = true
+	env.ssao_radius = 0.7
+	env.ssao_intensity = 1.8
+	env.ssao_detail = 1.2
+	env.ssr_enabled = true
+	env.ssr_max_steps = 64
+	env.ssr_fade_in = 0.15
+	env.ssr_fade_out = 2.0
+	# Subtle adjustments: a hint of vignette and warmer tint
+	env.adjustment_enabled = true
+	env.adjustment_brightness = 1.02
+	env.adjustment_contrast = 1.08
+	env.adjustment_saturation = 1.12
+	var wenv := WorldEnvironment.new()
+	wenv.environment = env
+	add_child(wenv)
+
+func _build_camera() -> void:
+	cam = Camera3D.new()
+	cam_base_pos = CAM_OFFSET_BASE
+	cam.position = cam_base_pos
+	cam.fov = 58.0
+	add_child(cam)
+	cam.look_at(Vector3.ZERO, Vector3.UP)
+	cam.make_current()
+	# Explicit 3D audio listener anchored to the camera — guarantees positional
+	# audio uses the camera position regardless of default-listener behaviour.
+	var listener := AudioListener3D.new()
+	cam.add_child(listener)
+	listener.make_current()
+
+func _build_lights() -> void:
+	# Very dim directional fill — cosmic ambient only, not a "sun". The real
+	# lighting comes from world-objects (planets, nebulae, projectiles, gems)
+	# each carrying their own OmniLight3D, so the ship is lit by what surrounds
+	# it instead of a fixed sky-sun. Shadows still come from this one so the
+	# ship has some shape grounding.
+	var key := DirectionalLight3D.new()
+	key.rotation_degrees = Vector3(-50, -30, 0)
+	key.light_color = Color(0.7, 0.78, 0.95)
+	key.light_energy = 0.55
+	key.shadow_enabled = true
+	key.shadow_bias = 0.05
+	key.shadow_normal_bias = 1.2
+	key.shadow_blur = 1.0
+	key.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
+	key.directional_shadow_max_distance = 80.0
+	add_child(key)
+	# Cold deep-space fill from below — prevents pure-black shadow side.
+	var fill := DirectionalLight3D.new()
+	fill.rotation_degrees = Vector3(50, 30, 0)
+	fill.light_color = Color(0.35, 0.55, 0.85)
+	fill.light_energy = 0.22
+	add_child(fill)
+
+# ============================================================
+# Materials
+# ============================================================
+
+func _build_materials() -> void:
+	mat_player = _make_mat(COL_PLAYER, COL_PLAYER_EMIT, 2.5, 0.25, 0.3)
+	mat_drone = _make_mat(COL_DRONE, COL_DRONE, 1.4, 0.45, 0.1)
+	mat_shooter = _make_mat(COL_SHOOTER, COL_SHOOTER, 1.4, 0.45, 0.1)
+	mat_tank = _make_mat(COL_TANK, COL_TANK, 1.1, 0.55, 0.2)
+	mat_boss = _make_mat(COL_BOSS, COL_BOSS, 1.8, 0.4, 0.1)
+	mat_proj = _make_mat(COL_PROJ, COL_PROJ, 2.5, 0.0, 0.0)
+	mat_e_bullet = _make_mat(COL_E_BULLET, COL_E_BULLET, 2.3, 0.0, 0.0)
+	mat_gem = _make_mat(COL_XP, COL_XP, 1.8, 0.3, 0.0)
+
+func _make_mat(albedo: Color, emit: Color, emit_energy: float, rough: float, metallic: float) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = albedo
+	m.emission_enabled = true
+	m.emission = emit
+	m.emission_energy_multiplier = emit_energy
+	m.roughness = rough
+	m.metallic = metallic
+	return m
+
+# ============================================================
+# World root
+# ============================================================
+
+func _build_world() -> void:
+	world = Node3D.new()
+	world.name = "World"
+	add_child(world)
+
+	bg_root = Node3D.new()
+	bg_root.name = "Background"
+	add_child(bg_root)
+
+	# (Floor plane removed — XY play plane doesn't need a horizontal floor)
+
+	# Arena rim removed — open space, no boundaries
+
+	# (Planet temporarily disabled for visibility debugging)
+
+func _build_arena_rim() -> void:
+	var rim_mat := StandardMaterial3D.new()
+	rim_mat.albedo_color = Color(0.2, 0.45, 0.7)
+	rim_mat.emission_enabled = true
+	rim_mat.emission = Color(0.25, 0.6, 1.0)
+	rim_mat.emission_energy_multiplier = 1.4
+	rim_mat.roughness = 0.5
+	var hw: float = ARENA_W * 0.5
+	var hh: float = ARENA_H * 0.5
+	var thickness: float = 0.12
+	# Top, bottom, left, right
+	var bars := [
+		[Vector3(0, hh, 0), Vector3(ARENA_W, thickness, thickness)],
+		[Vector3(0, -hh, 0), Vector3(ARENA_W, thickness, thickness)],
+		[Vector3(-hw, 0, 0), Vector3(thickness, ARENA_H, thickness)],
+		[Vector3(hw, 0, 0), Vector3(thickness, ARENA_H, thickness)],
+	]
+	for b in bars:
+		var bm := BoxMesh.new()
+		bm.size = b[1]
+		bm.material = rim_mat
+		var inst := MeshInstance3D.new()
+		inst.mesh = bm
+		inst.position = b[0]
+		world.add_child(inst)
+
+func _build_starfield() -> void:
+	# Many small far stars with parallax depth
+	var star_mat := StandardMaterial3D.new()
+	star_mat.albedo_color = Color(1, 1, 1)
+	star_mat.emission_enabled = true
+	star_mat.emission = Color(1, 1, 1)
+	star_mat.emission_energy_multiplier = 3.0
+	star_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+
+	var orange_mat := StandardMaterial3D.new()
+	orange_mat.albedo_color = Color(1, 0.7, 0.4)
+	orange_mat.emission_enabled = true
+	orange_mat.emission = Color(1, 0.7, 0.4)
+	orange_mat.emission_energy_multiplier = 2.5
+	orange_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+
+	for i in 220:
+		var sm := SphereMesh.new()
+		var r: float = randf_range(0.04, 0.14)
+		sm.radius = r
+		sm.height = r * 2
+		sm.material = star_mat if randf() < 0.85 else orange_mat
+		var inst := MeshInstance3D.new()
+		inst.mesh = sm
+		inst.position = Vector3(
+			randf_range(-50, 50),
+			randf_range(-30, 30),
+			randf_range(-60, -10)
+		)
+		bg_root.add_child(inst)
+		stars.append(inst)
+
+func _build_distant_objects() -> void:
+	# Background planets at varying sizes / distances
+	for i in 7:
+		_spawn_random_planet()
+	# A couple distant background nebulae behind the action plane
+	for i in 2:
+		_spawn_random_nebula()
+	# Flyable nebulae in the XY play plane. One close to start so the player
+	# encounters one within a few seconds, plus a second further out.
+	_spawn_flyable_nebula(true)
+	_spawn_flyable_nebula(false)
+	# Asteroid clusters
+	for i in 6:
+		_spawn_random_asteroid_cluster()
+
+const PLANET_SHADER_CODE := """
+shader_type spatial;
+
+uniform sampler2D noise_a : hint_default_white;
+uniform sampler2D noise_b : hint_default_white;
+uniform vec4 sea_col : source_color;
+uniform vec4 land_col : source_color;
+uniform vec4 ice_col : source_color = vec4(0.92, 0.97, 1.0, 1.0);
+uniform vec4 atmo_col : source_color = vec4(0.5, 0.7, 1.0, 1.0);
+uniform vec4 cloud_col : source_color = vec4(0.96, 0.96, 0.98, 1.0);
+uniform float land_thresh : hint_range(0.0, 1.0) = 0.5;
+uniform float ice_strength : hint_range(0.0, 1.0) = 0.0;
+uniform float cloud_strength : hint_range(0.0, 1.0) = 0.0;
+uniform float cloud_thresh : hint_range(0.0, 1.0) = 0.6;
+uniform float atmo_strength : hint_range(0.0, 3.0) = 1.0;
+uniform float emit_boost : hint_range(0.0, 1.0) = 0.3;
+uniform float gas_banding : hint_range(0.0, 1.0) = 0.0;
+uniform float cloud_speed = 0.005;
+uniform float roughness_val : hint_range(0.0, 1.0) = 0.88;
+
+void fragment() {
+	vec2 uv = UV;
+	// Gas giants: stretch noise into horizontal bands; rocky/ocean keep normal UVs
+	vec2 surf_uv = mix(uv, vec2(uv.x * 0.5, uv.y * 6.0), gas_banding);
+	float n_a = texture(noise_a, surf_uv).r;
+	float n_b = texture(noise_b, surf_uv * 2.7).r;
+	float n_surf = mix(n_a, n_b, 0.25);
+
+	// Continents / seas
+	float land = smoothstep(land_thresh - 0.05, land_thresh + 0.05, n_surf);
+	vec3 base = mix(sea_col.rgb, land_col.rgb, land);
+
+	// Polar ice with noisy edge so caps aren't perfect circles
+	float lat = abs(uv.y - 0.5) * 2.0;
+	float ice = smoothstep(0.78, 0.96, lat + (n_b - 0.5) * 0.18) * ice_strength;
+	base = mix(base, ice_col.rgb, ice);
+
+	// Cloud layer — drifts around equator independently of surface
+	vec2 cloud_uv = uv + vec2(TIME * cloud_speed, 0.0);
+	float n_cl1 = texture(noise_b, cloud_uv * 1.5).r;
+	float n_cl2 = texture(noise_a, cloud_uv * 3.1 + vec2(0.31, 0.17)).r;
+	float cl_n = (n_cl1 + n_cl2) * 0.5;
+	float cloud = smoothstep(cloud_thresh, cloud_thresh + 0.18, cl_n) * cloud_strength;
+	base = mix(base, cloud_col.rgb, cloud);
+
+	// Atmospheric rim glow via Fresnel against view-space normal
+	float rim = 1.0 - clamp(dot(normalize(NORMAL), normalize(VIEW)), 0.0, 1.0);
+	rim = pow(rim, 2.6);
+	vec3 atmo = atmo_col.rgb * rim * atmo_strength;
+
+	ALBEDO = base;
+	EMISSION = base * emit_boost + atmo;
+	METALLIC = 0.0;
+	ROUGHNESS = roughness_val;
+}
+"""
+
+func _make_planet_noise(freq: float, octaves: int, simplex: bool) -> ImageTexture:
+	# Sync noise generation — NoiseTexture2D is async and the shader would sample
+	# the default white value until the texture finished, leaving planets uniform.
+	var ns := FastNoiseLite.new()
+	ns.noise_type = FastNoiseLite.TYPE_SIMPLEX if simplex else FastNoiseLite.TYPE_PERLIN
+	ns.seed = randi()
+	ns.frequency = freq
+	ns.fractal_octaves = octaves
+	ns.fractal_lacunarity = 2.1
+	ns.fractal_gain = 0.55
+	var img: Image = ns.get_seamless_image(512, 256, false, false, 0.1)
+	return ImageTexture.create_from_image(img)
+
+func _make_planet_material(sea_col: Color, land_col: Color, atmo_col: Color,
+		ice_strength: float, cloud_strength: float, gas_banding: float,
+		roughness_val: float, emit_boost: float, atmo_strength: float,
+		surface_freq: float = 0.012, detail_freq: float = 0.03) -> ShaderMaterial:
+	var tex_a: ImageTexture = _make_planet_noise(surface_freq, 5, false)
+	var tex_b: ImageTexture = _make_planet_noise(detail_freq, 4, true)
+	var shader := Shader.new()
+	shader.code = PLANET_SHADER_CODE
+	var mat := ShaderMaterial.new()
+	mat.shader = shader
+	mat.set_shader_parameter("noise_a", tex_a)
+	mat.set_shader_parameter("noise_b", tex_b)
+	mat.set_shader_parameter("sea_col", sea_col)
+	mat.set_shader_parameter("land_col", land_col)
+	mat.set_shader_parameter("atmo_col", atmo_col)
+	mat.set_shader_parameter("land_thresh", randf_range(0.45, 0.58))
+	mat.set_shader_parameter("ice_strength", ice_strength)
+	mat.set_shader_parameter("cloud_strength", cloud_strength)
+	mat.set_shader_parameter("cloud_thresh", randf_range(0.55, 0.68))
+	mat.set_shader_parameter("atmo_strength", atmo_strength)
+	mat.set_shader_parameter("emit_boost", emit_boost)
+	mat.set_shader_parameter("gas_banding", gas_banding)
+	mat.set_shader_parameter("cloud_speed", randf_range(0.003, 0.008))
+	mat.set_shader_parameter("roughness_val", roughness_val)
+	return mat
+
+func _add_moon(parent: Node3D, orbit_radius: float, moon_radius: float) -> void:
+	# Small cratered companion that orbits the parent planet (parent rotation drives orbit).
+	var hue: float = randf() * 0.1 + 0.06  # grey-brown tones
+	var sea_col: Color = Color.from_hsv(hue, 0.25, randf_range(0.35, 0.55))
+	var land_col: Color = sea_col.darkened(randf_range(0.2, 0.45))
+	var atmo_col: Color = Color.from_hsv(0.07, 0.3, 0.7)
+	var mat: ShaderMaterial = _make_planet_material(
+		sea_col, land_col, atmo_col,
+		0.0, 0.0, 0.0,
+		0.98, 0.25, 0.15,
+		0.04, 0.09)
+	var moon := MeshInstance3D.new()
+	var sm := SphereMesh.new()
+	sm.radius = moon_radius
+	sm.height = moon_radius * 2
+	sm.radial_segments = 28
+	sm.rings = 14
+	sm.material = mat
+	moon.mesh = sm
+	var ang: float = randf() * TAU
+	var pitch: float = randf_range(-0.25, 0.25)
+	var op: Vector3 = Vector3(cos(ang) * cos(pitch), sin(pitch), sin(ang) * cos(pitch)) * orbit_radius
+	moon.position = op
+	parent.add_child(moon)
+
+func _spawn_random_planet() -> void:
+	# Procedural shader-driven planet — one opaque sphere, no transparency overlap.
+	# Size class (small moon / medium / gas giant) drives radius, distance and biome bias.
+	var size_roll: float = randf()
+	var radius: float
+	var dist_min: float
+	var dist_max: float
+	var size_class: String
+	if size_roll < 0.32:
+		# Small moon-like
+		radius = randf_range(1.6, 3.0)
+		dist_min = 80.0
+		dist_max = 180.0
+		size_class = "small"
+	elif size_roll < 0.80:
+		# Standard planet
+		radius = randf_range(4.0, 7.5)
+		dist_min = 140.0
+		dist_max = 260.0
+		size_class = "medium"
+	else:
+		# Gas giant or large rocky world
+		radius = randf_range(9.5, 15.0)
+		dist_min = 220.0
+		dist_max = 360.0
+		size_class = "large"
+
+	var hue: float = randf()
+	# Biome distribution biased by size: small → rocky/volcanic, large → gas giant
+	var biome_roll: float = randf()
+	match size_class:
+		"small":
+			# 0..0.28 rocky, 0.82..1.0 volcanic — skip ocean / gas
+			biome_roll = randf_range(0.0, 0.28) if randf() < 0.7 else randf_range(0.82, 1.0)
+		"large":
+			# Mostly gas giants (0.58..0.82), occasionally ocean
+			biome_roll = randf_range(0.58, 0.82) if randf() < 0.75 else randf_range(0.28, 0.58)
+		_:
+			pass
+
+	var sea_col: Color
+	var land_col: Color
+	var atmo_col: Color
+	var ice_strength: float = 0.0
+	var cloud_strength: float = 0.0
+	var gas_banding: float = 0.0
+	var roughness_val: float = 0.88
+	var emit_boost: float = 0.32
+
+	if biome_roll < 0.28:
+		# Rocky / desert — Mars-like
+		sea_col = Color.from_hsv(0.05 + randf() * 0.05, 0.55, 0.55)
+		land_col = sea_col.darkened(0.35)
+		atmo_col = Color.from_hsv(0.07, 0.4, 1.0)
+		roughness_val = 0.95
+	elif biome_roll < 0.58:
+		# Ocean / earth-like
+		sea_col = Color.from_hsv(0.58 + randf() * 0.06, 0.78, 0.42)
+		land_col = Color.from_hsv(0.27 + randf() * 0.08, 0.6, 0.5)
+		atmo_col = Color.from_hsv(0.58, 0.55, 1.0)
+		ice_strength = 1.0
+		cloud_strength = 0.7
+	elif biome_roll < 0.82:
+		# Gas giant — banded
+		sea_col = Color.from_hsv(hue, 0.55, 0.7)
+		land_col = Color.from_hsv(fmod(hue + 0.06, 1.0), 0.7, 0.55)
+		atmo_col = Color.from_hsv(fmod(hue + 0.03, 1.0), 0.4, 1.0)
+		gas_banding = 1.0
+		cloud_strength = 0.45
+		emit_boost = 0.38
+	else:
+		# Volcanic
+		sea_col = Color.from_hsv(0.02 + randf() * 0.03, 0.85, 0.38)
+		land_col = Color.from_hsv(0.07 + randf() * 0.03, 0.95, 0.85)
+		atmo_col = Color.from_hsv(0.04, 0.7, 1.0)
+		roughness_val = 0.7
+		emit_boost = 0.45
+
+	var planet := Node3D.new()
+	planet.position = _random_distant_pos(dist_min, dist_max)
+	# Random axial tilt and orientation so each planet looks unique
+	planet.rotation = Vector3(randf_range(-0.4, 0.4), randf() * TAU, randf_range(-0.3, 0.3))
+
+	var mat: ShaderMaterial = _make_planet_material(
+		sea_col, land_col, atmo_col,
+		ice_strength, cloud_strength, gas_banding,
+		roughness_val, emit_boost, randf_range(0.85, 1.4))
+
+	var surface := MeshInstance3D.new()
+	var ssm := SphereMesh.new()
+	ssm.radius = radius
+	ssm.height = radius * 2
+	ssm.radial_segments = 64
+	ssm.rings = 32
+	ssm.material = mat
+	surface.mesh = ssm
+	planet.add_child(surface)
+
+	# Planet acts as a light source — its surface colour bleeds onto nearby
+	# objects (most importantly the ship when it gets close). Range scales with
+	# planet radius so bigger planets light a wider area.
+	var planet_light := OmniLight3D.new()
+	var light_col: Color = sea_col.lerp(land_col, 0.5)
+	# Boost brightness slightly so it's visible against deep-space ambient
+	light_col = light_col.lerp(Color(1, 1, 1), 0.3)
+	planet_light.light_color = light_col
+	planet_light.light_energy = 1.4 + radius * 0.08
+	planet_light.omni_range = radius * 8.0 + 30.0
+	planet_light.omni_attenuation = 1.4
+	planet.add_child(planet_light)
+
+	# Ring system — gas giants likely, large rocky / ocean worlds occasionally
+	var ring_chance: float = 0.0
+	if gas_banding > 0.5:
+		ring_chance = 0.75
+	elif size_class == "large":
+		ring_chance = 0.25
+	if randf() < ring_chance:
+		var ring := MeshInstance3D.new()
+		var tm := TorusMesh.new()
+		tm.inner_radius = radius * 1.55
+		tm.outer_radius = radius * randf_range(2.2, 2.7)
+		tm.ring_segments = 64
+		tm.rings = 6
+		var rmat := StandardMaterial3D.new()
+		var ring_color: Color = Color.from_hsv(fmod(hue + 0.18, 1.0), 0.35, 0.78)
+		rmat.albedo_color = Color(ring_color.r, ring_color.g, ring_color.b, 0.7)
+		rmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		rmat.emission_enabled = true
+		rmat.emission = ring_color
+		rmat.emission_energy_multiplier = 0.25
+		rmat.cull_mode = BaseMaterial3D.CULL_DISABLED
+		tm.material = rmat
+		ring.mesh = tm
+		ring.rotation_degrees = Vector3(randf_range(-25, 25), randf_range(-40, 40), randf_range(-15, 15))
+		planet.add_child(ring)
+
+	# Moons orbit medium / large planets — children of the planet root inherit its
+	# slow rotation, so their position swings around the parent (orbital motion).
+	var moon_chance: float = 0.0
+	var max_moons: int = 0
+	if size_class == "large":
+		moon_chance = 0.85
+		max_moons = 3
+	elif size_class == "medium":
+		moon_chance = 0.35
+		max_moons = 2
+	if randf() < moon_chance:
+		var moon_count: int = randi_range(1, max_moons)
+		for i in moon_count:
+			var moon_r: float = radius * randf_range(0.12, 0.22)
+			var orbit_r: float = radius * randf_range(1.6, 2.6) + moon_r
+			_add_moon(planet, orbit_r, moon_r)
+
+	var wrap_r: float = 340.0
+	if size_class == "small":
+		wrap_r = 240.0
+	elif size_class == "large":
+		wrap_r = 420.0
+	bg_root.add_child(planet)
+	distant_objects.append({
+		"node": planet,
+		"wrap_radius": wrap_r,
+		"rot_axis": Vector3(randf_range(-0.2, 0.2), 1.0, randf_range(-0.2, 0.2)).normalized(),
+		"rot_speed": randf_range(0.03, 0.12),
+	})
+
+const NEBULA_SHADER_CODE := """
+shader_type spatial;
+render_mode unshaded, depth_draw_never, cull_disabled;
+
+uniform sampler2D noise_a : hint_default_white;
+uniform sampler2D noise_b : hint_default_white;
+uniform vec4 color_outer : source_color;
+uniform vec4 color_inner : source_color;
+uniform vec4 lightning_col : source_color = vec4(0.85, 0.92, 1.35, 1.0);
+uniform float density : hint_range(0.0, 4.0) = 1.4;
+uniform float drift_speed = 0.008;
+uniform float displacement = 3.0;
+uniform float swirl_strength : hint_range(0.0, 0.6) = 0.18;
+uniform float lightning_strength : hint_range(0.0, 4.0) = 0.0;
+uniform float lightning_rate = 0.7;
+uniform float pulse_strength : hint_range(0.0, 0.4) = 0.15;
+uniform float pulse_rate = 0.13;
+
+float h11(float p) { return fract(sin(p * 41.3) * 4321.0); }
+
+void vertex() {
+	// Vertex displacement: irregular silhouette, plus a slow breathing pulse so
+	// the whole shape is gently flexing over time.
+	float n = texture(noise_a, UV).r;
+	float breathe = sin(TIME * 0.21) * 0.05;
+	VERTEX += NORMAL * (n - 0.5 + breathe) * displacement;
+}
+
+void fragment() {
+	vec2 uv = UV;
+
+	// Domain warp — sample a slow noise field and use it to perturb UV before
+	// sampling the gas noise. Produces swirling, billowing motion instead of
+	// flat scrolling.
+	vec2 warp_uv = uv * 0.7 + vec2(TIME * drift_speed * 0.4, -TIME * drift_speed * 0.25);
+	float wx = texture(noise_a, warp_uv).r - 0.5;
+	float wy = texture(noise_a, warp_uv + vec2(0.37, 0.21)).r - 0.5;
+	vec2 warp = vec2(wx, wy) * swirl_strength;
+
+	// Two gas-noise layers — different scales and drift directions, both warped
+	vec2 uv1 = uv + warp + vec2(TIME * drift_speed, TIME * drift_speed * 0.3);
+	vec2 uv2 = uv * 2.3 + warp * 1.6 + vec2(-TIME * drift_speed * 0.7, TIME * drift_speed * 0.5);
+	float n1 = texture(noise_a, uv1).r;
+	float n2 = texture(noise_b, uv2).r;
+	float n = mix(n1, n2, 0.45);
+	n = pow(n, 1.8);
+
+	// Slow density pulse — nebula breathes
+	n *= 1.0 + pulse_strength * sin(TIME * pulse_rate);
+
+	// Soft edge — never fully fades so inside-view still shows gas in peripheral directions
+	float edge_dot = abs(dot(normalize(NORMAL), normalize(VIEW)));
+	float edge = mix(0.55, 1.0, edge_dot);
+
+	float hot = smoothstep(0.45, 0.85, n);
+	vec3 col = mix(color_outer.rgb, color_inner.rgb, hot);
+	vec3 emit = col * (0.6 + hot * 1.8);
+	float a = n * edge * density;
+
+	// Lightning bursts — periodic flashes at random positions inside dense gas
+	if (lightning_strength > 0.0) {
+		float lt = TIME * lightning_rate;
+		float bolt_id = floor(lt);
+		float ph = fract(lt);
+		// Sharp flash that ramps up fast and decays exponentially
+		float flash = exp(-ph * 9.0) * smoothstep(0.0, 0.04, ph);
+		// Random bolt position per cycle
+		vec2 bolt_uv = vec2(h11(bolt_id * 2.71), h11(bolt_id * 7.13));
+		vec2 d = uv - bolt_uv;
+		float local = exp(-dot(d, d) * 70.0);
+		// High-freq noise filaments give branchy lightning shape
+		float fil_n = texture(noise_b, uv * 8.0 + vec2(h11(bolt_id), h11(bolt_id + 0.5))).r;
+		float fil = smoothstep(0.76, 0.93, fil_n);
+		float bolt = (local + local * fil * 1.8) * flash * lightning_strength;
+		// Only fire inside dense gas regions
+		bolt *= smoothstep(0.25, 0.6, n);
+		emit += lightning_col.rgb * bolt * 3.0;
+		a += bolt * 0.45;
+	}
+
+	ALBEDO = emit;
+	EMISSION = emit * 0.35;
+	ALPHA = clamp(a, 0.0, 1.0);
+}
+"""
+
+func _spawn_random_nebula() -> void:
+	# Volumetric-feeling gas cloud: shader-driven wisps + irregular silhouette + bright cores.
+	var radius: float = randf_range(12.0, 22.0)
+	var hue: float = randf()
+	var color_outer: Color = Color.from_hsv(hue, 0.65, 0.5)
+	var color_inner: Color = Color.from_hsv(fmod(hue + 0.08, 1.0), 0.85, 1.0)
+
+	var nebula := Node3D.new()
+	nebula.position = _random_distant_pos(80.0, 150.0)
+	nebula.rotation = Vector3(randf() * TAU, randf() * TAU, randf() * TAU)
+
+	var tex_a: ImageTexture = _make_planet_noise(0.018, 5, false)
+	var tex_b: ImageTexture = _make_planet_noise(0.04, 4, true)
+
+	var shader := Shader.new()
+	shader.code = NEBULA_SHADER_CODE
+	var mat := ShaderMaterial.new()
+	mat.shader = shader
+	mat.set_shader_parameter("noise_a", tex_a)
+	mat.set_shader_parameter("noise_b", tex_b)
+	mat.set_shader_parameter("color_outer", color_outer)
+	mat.set_shader_parameter("color_inner", color_inner)
+	mat.set_shader_parameter("density", randf_range(1.2, 2.0))
+	mat.set_shader_parameter("drift_speed", randf_range(0.005, 0.014))
+	mat.set_shader_parameter("displacement", radius * randf_range(0.28, 0.5))
+	mat.set_shader_parameter("swirl_strength", randf_range(0.12, 0.28))
+	mat.set_shader_parameter("pulse_strength", randf_range(0.08, 0.22))
+	mat.set_shader_parameter("pulse_rate", randf_range(0.08, 0.20))
+	# 35% chance of being a storm nebula with lightning
+	if randf() < 0.35:
+		mat.set_shader_parameter("lightning_strength", randf_range(0.5, 1.1))
+		mat.set_shader_parameter("lightning_rate", randf_range(0.4, 1.1))
+
+	var shell := MeshInstance3D.new()
+	var sm := SphereMesh.new()
+	sm.radius = radius
+	sm.height = radius * 2
+	sm.radial_segments = 48
+	sm.rings = 24
+	sm.material = mat
+	shell.mesh = sm
+	nebula.add_child(shell)
+
+	# Nebula casts a soft coloured glow on nearby ships — uses the inner gas tint.
+	var neb_light := OmniLight3D.new()
+	neb_light.light_color = color_inner
+	neb_light.light_energy = 1.1
+	neb_light.omni_range = radius * 4.5
+	neb_light.omni_attenuation = 1.5
+	nebula.add_child(neb_light)
+
+	# Bright stellar-nursery cores embedded in the gas
+	var spot_count: int = randi_range(2, 5)
+	for i in spot_count:
+		var spot := MeshInstance3D.new()
+		var ssm := SphereMesh.new()
+		var sr: float = randf_range(0.5, 1.2)
+		ssm.radius = sr
+		ssm.height = sr * 2
+		ssm.radial_segments = 14
+		ssm.rings = 8
+		var smat := StandardMaterial3D.new()
+		var sc: Color = color_inner.lerp(Color(1, 1, 1), randf_range(0.3, 0.65))
+		smat.albedo_color = sc
+		smat.emission_enabled = true
+		smat.emission = sc
+		smat.emission_energy_multiplier = randf_range(2.5, 4.5)
+		smat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		ssm.material = smat
+		spot.mesh = ssm
+		var dir: Vector3 = Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)).normalized()
+		spot.position = dir * radius * randf_range(0.15, 0.55)
+		nebula.add_child(spot)
+
+	bg_root.add_child(nebula)
+	distant_objects.append({
+		"node": nebula,
+		"wrap_radius": 250.0,
+		"rot_axis": Vector3(randf_range(-0.3, 0.3), 1.0, randf_range(-0.3, 0.3)).normalized(),
+		"rot_speed": randf_range(0.005, 0.02),
+	})
+
+func _spawn_flyable_nebula(near_start: bool = false) -> void:
+	# Large nebula placed in the XY play plane so the player can fly through it.
+	# Alpha-blended so it acts like a real cloud — visible from outside AND from
+	# inside. Non-uniform scale produces flat / elongated / spherical variants.
+	var radius: float = randf_range(28.0, 55.0)
+	var hue: float = randf()
+	var color_outer: Color = Color.from_hsv(hue, 0.55, 0.4)
+	var color_inner: Color = Color.from_hsv(fmod(hue + 0.08, 1.0), 0.8, 0.95)
+
+	var nebula := Node3D.new()
+	var ang: float = randf() * TAU
+	var dist: float
+	if near_start:
+		dist = randf_range(28.0, 45.0)
+	else:
+		dist = randf_range(60.0, 140.0)
+	nebula.position = Vector3(cos(ang) * dist, sin(ang) * dist, randf_range(-4.0, 4.0))
+	nebula.rotation = Vector3(randf() * TAU, randf() * TAU, randf() * TAU)
+
+	# Shape variation: flat disc / elongated cigar / spherical
+	var shape_roll: float = randf()
+	var sx: float = 1.0
+	var sy: float = 1.0
+	var sz: float = 1.0
+	if shape_roll < 0.35:
+		# Flat disc-shaped — galactic-plane look
+		sy = randf_range(0.22, 0.45)
+		sx = randf_range(0.9, 1.3)
+		sz = randf_range(0.9, 1.3)
+	elif shape_roll < 0.65:
+		# Elongated along a random axis
+		var ax: int = randi() % 3
+		match ax:
+			0:
+				sx = randf_range(1.4, 2.1)
+				sy = randf_range(0.5, 0.8)
+				sz = randf_range(0.6, 0.9)
+			1:
+				sy = randf_range(1.4, 2.1)
+				sx = randf_range(0.5, 0.8)
+				sz = randf_range(0.6, 0.9)
+			_:
+				sz = randf_range(1.4, 2.1)
+				sx = randf_range(0.6, 0.9)
+				sy = randf_range(0.5, 0.8)
+	# else: roughly spherical (default 1,1,1)
+	nebula.scale = Vector3(sx, sy, sz)
+
+	var tex_a: ImageTexture = _make_planet_noise(0.014, 5, false)
+	var tex_b: ImageTexture = _make_planet_noise(0.035, 4, true)
+
+	var shader := Shader.new()
+	shader.code = NEBULA_SHADER_CODE
+	var mat := ShaderMaterial.new()
+	mat.shader = shader
+	mat.set_shader_parameter("noise_a", tex_a)
+	mat.set_shader_parameter("noise_b", tex_b)
+	mat.set_shader_parameter("color_outer", color_outer)
+	mat.set_shader_parameter("color_inner", color_inner)
+	mat.set_shader_parameter("density", randf_range(0.85, 1.5))
+	mat.set_shader_parameter("drift_speed", randf_range(0.004, 0.012))
+	mat.set_shader_parameter("displacement", radius * randf_range(0.3, 0.55))
+	mat.set_shader_parameter("swirl_strength", randf_range(0.18, 0.38))
+	mat.set_shader_parameter("pulse_strength", randf_range(0.12, 0.28))
+	mat.set_shader_parameter("pulse_rate", randf_range(0.10, 0.25))
+	# 65% chance for flyable nebulae to have lightning storms. Storm nebulae are
+	# also registered for collision damage — flying through them can hurt.
+	var is_storm: bool = randf() < 0.65
+	if is_storm:
+		mat.set_shader_parameter("lightning_strength", randf_range(0.7, 1.4))
+		mat.set_shader_parameter("lightning_rate", randf_range(0.5, 1.4))
+
+	var shell := MeshInstance3D.new()
+	var sm := SphereMesh.new()
+	sm.radius = radius
+	sm.height = radius * 2
+	sm.radial_segments = 56
+	sm.rings = 28
+	sm.material = mat
+	shell.mesh = sm
+	nebula.add_child(shell)
+
+	# Flyable nebulae are large and the player flies through them — give them
+	# a stronger interior glow that lights up the ship while inside the cloud.
+	var fneb_light := OmniLight3D.new()
+	fneb_light.light_color = color_inner
+	fneb_light.light_energy = 1.6
+	fneb_light.omni_range = radius * 2.2
+	fneb_light.omni_attenuation = 1.3
+	nebula.add_child(fneb_light)
+
+	# Embedded stellar nursery cores
+	var spot_count: int = randi_range(3, 7)
+	for i in spot_count:
+		var spot := MeshInstance3D.new()
+		var ssm := SphereMesh.new()
+		var sr: float = randf_range(0.5, 1.4)
+		ssm.radius = sr
+		ssm.height = sr * 2
+		ssm.radial_segments = 14
+		ssm.rings = 8
+		var smat := StandardMaterial3D.new()
+		var sc: Color = color_inner.lerp(Color(1, 1, 1), randf_range(0.35, 0.7))
+		smat.albedo_color = sc
+		smat.emission_enabled = true
+		smat.emission = sc
+		smat.emission_energy_multiplier = randf_range(3.0, 5.0)
+		smat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		ssm.material = smat
+		spot.mesh = ssm
+		var dir: Vector3 = Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)).normalized()
+		spot.position = dir * radius * randf_range(0.15, 0.6)
+		nebula.add_child(spot)
+
+	bg_root.add_child(nebula)
+	distant_objects.append({
+		"node": nebula,
+		"wrap_radius": 180.0,
+		"rot_axis": Vector3(randf_range(-0.3, 0.3), 1.0, randf_range(-0.3, 0.3)).normalized(),
+		"rot_speed": randf_range(0.003, 0.012),
+	})
+	if is_storm:
+		storm_nebulae.append({
+			"node": nebula,
+			"radius": radius,
+			"damage": randi_range(6, 12),
+			"strike_timer": randf_range(2.0, 4.0),
+			"interval_min": 1.8,
+			"interval_max": 4.5,
+		})
+		# 3D positional thunder rumble — louder as the player approaches the nebula
+		if thunder_stream != null:
+			var ap := AudioStreamPlayer3D.new()
+			ap.stream = thunder_stream
+			ap.volume_db = -18.0
+			ap.unit_size = radius * 0.7
+			ap.max_distance = radius * 5.0
+			ap.attenuation_model = AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
+			ap.pitch_scale = randf_range(0.85, 1.1)
+			nebula.add_child(ap)
+			ap.play()
+
+func _spawn_random_asteroid_cluster() -> void:
+	var cluster := Node3D.new()
+	cluster.position = _random_distant_pos(30.0, 110.0)
+	var rock_color: Color = Color(randf_range(0.25, 0.45), randf_range(0.22, 0.38), randf_range(0.2, 0.35))
+	var mat := _make_proc_hull_mat(rock_color)
+	mat.metallic = 0.15
+	mat.roughness = 0.9
+	mat.emission_energy_multiplier = 0.04
+	var count: int = randi_range(6, 14)
+	for i in count:
+		var a := MeshInstance3D.new()
+		var pm := PrismMesh.new()
+		var s: float = randf_range(0.4, 1.6)
+		pm.size = Vector3(s, s * randf_range(0.7, 1.3), s * randf_range(0.8, 1.2))
+		pm.material = mat
+		a.mesh = pm
+		a.position = Vector3(randf_range(-5, 5), randf_range(-3, 3), randf_range(-5, 5))
+		a.rotation_degrees = Vector3(randf_range(0, 360), randf_range(0, 360), randf_range(0, 360))
+		cluster.add_child(a)
+	bg_root.add_child(cluster)
+	distant_objects.append({
+		"node": cluster,
+		"wrap_radius": 180.0,
+		"rot_axis": Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)).normalized(),
+		"rot_speed": randf_range(0.02, 0.1),
+	})
+
+func _random_distant_pos(min_dist: float, max_dist: float) -> Vector3:
+	# Position in a 3D shell with strong negative-Z bias (behind/below the action plane)
+	var ang: float = randf() * TAU
+	var pitch: float = randf_range(-0.4, 0.4)
+	var dist: float = randf_range(min_dist, max_dist)
+	var dir: Vector3 = Vector3(cos(ang) * cos(pitch), sin(pitch) * 0.5, sin(ang) * cos(pitch))
+	return Vector3(dir.x * dist, dir.y * dist, -abs(dir.z * dist) - 40.0)
+
+# ============================================================
+# Player visual
+# ============================================================
+
+func _build_player() -> void:
+	# F-22 / Starfury inspired fighter-jet design adapted as a space craft.
+	# Airplane frame: +X = forward, +Y = up, ±Z = wings. Coordinates kept within
+	# the same envelope as the previous ship so upgrade-visual functions still
+	# fit (guns on wings ±Z, sensors on top +Y, pierce-spike at nose +X, etc.).
+	p_node = Node3D.new()
+	p_node.position = p_pos
+	world.add_child(p_node)
+	p_node.scale = Vector3.ONE * SHIP_SCALE_BASE * u_range_mult
+
+	# Tilted child node — all ship meshes + upgrade attachments live here.
+	# +90° around X converts the "airplane" build (wings in ±Z) into top-down
+	# (wings in ±Y after yaw), so yaw rotates everything correctly.
+	ship_render = Node3D.new()
+	ship_render.rotation_degrees = Vector3(90, 0, 0)
+	p_node.add_child(ship_render)
+	# (Everything else attaches to ship_render, not p_node.)
+
+	# ===== Materials =====
+	# Stealth-paint hull — desaturated slate-blue, clearcoat over metallic
+	# base, mimics F-22 RAM coating. Emission stays low so external lights
+	# (planets, projectiles) drive the look.
+	var mat_hull := StandardMaterial3D.new()
+	mat_hull.albedo_color = Color(0.22, 0.27, 0.36)
+	mat_hull.metallic = 0.5
+	mat_hull.roughness = 0.32
+	mat_hull.metallic_specular = 0.55
+	mat_hull.emission_enabled = true
+	mat_hull.emission = Color(0.04, 0.08, 0.16)
+	mat_hull.emission_energy_multiplier = 0.10
+	mat_hull.rim_enabled = true
+	mat_hull.rim = 0.6
+	mat_hull.rim_tint = 0.4
+	mat_hull.clearcoat_enabled = true
+	mat_hull.clearcoat = 0.45
+	mat_hull.clearcoat_roughness = 0.18
+
+	# Accent panel — lighter steel-blue, used for spine, vertical-stab edges
+	var mat_accent := StandardMaterial3D.new()
+	mat_accent.albedo_color = Color(0.42, 0.55, 0.78)
+	mat_accent.metallic = 0.85
+	mat_accent.roughness = 0.24
+	mat_accent.emission_enabled = true
+	mat_accent.emission = Color(0.18, 0.36, 0.7)
+	mat_accent.emission_energy_multiplier = 0.22
+	mat_accent.rim_enabled = true
+	mat_accent.rim = 0.45
+	mat_accent.clearcoat_enabled = true
+	mat_accent.clearcoat = 0.5
+	mat_accent.clearcoat_roughness = 0.15
+
+	# Very dark — armor edges, gun mounts, intake interiors, engine bay
+	var mat_dark := StandardMaterial3D.new()
+	mat_dark.albedo_color = Color(0.04, 0.05, 0.07)
+	mat_dark.metallic = 0.55
+	mat_dark.roughness = 0.5
+	mat_dark.metallic_specular = 0.4
+
+	# Intake interior — pitch-black with deep red glow ("compressor blade glow")
+	var mat_intake := StandardMaterial3D.new()
+	mat_intake.albedo_color = Color(0.02, 0.02, 0.03)
+	mat_intake.metallic = 0.2
+	mat_intake.roughness = 0.85
+	mat_intake.emission_enabled = true
+	mat_intake.emission = Color(1.0, 0.45, 0.25)
+	mat_intake.emission_energy_multiplier = 1.4
+
+	# Cockpit glass — high-reflectivity tear-drop canopy with blue interior tint
+	var mat_glass := StandardMaterial3D.new()
+	mat_glass.albedo_color = Color(0.02, 0.04, 0.10)
+	mat_glass.metallic = 1.0
+	mat_glass.roughness = 0.03
+	mat_glass.emission_enabled = true
+	mat_glass.emission = Color(0.20, 0.55, 0.95)
+	mat_glass.emission_energy_multiplier = 0.5
+	mat_glass.rim_enabled = true
+	mat_glass.rim = 0.85
+	mat_glass.rim_tint = 0.7
+	mat_glass.clearcoat_enabled = true
+	mat_glass.clearcoat = 1.0
+	mat_glass.clearcoat_roughness = 0.02
+
+	# Thin engraved panel-seam material
+	var mat_panel_line := StandardMaterial3D.new()
+	mat_panel_line.albedo_color = Color(0.015, 0.02, 0.03)
+	mat_panel_line.metallic = 0.2
+	mat_panel_line.roughness = 0.8
+
+	# Cyan glowing strip — wing leading edges, intake lips, accent seams
+	var mat_panel_glow := StandardMaterial3D.new()
+	mat_panel_glow.albedo_color = Color(0.55, 0.92, 1.0)
+	mat_panel_glow.emission_enabled = true
+	mat_panel_glow.emission = Color(0.35, 0.8, 1.0)
+	mat_panel_glow.emission_energy_multiplier = 2.6
+	mat_panel_glow.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+
+	# ============================================================
+	#                  FUSELAGE (centerline body)
+	# ============================================================
+	# Sharp, faceted fighter body: flat box for the bulk volume, then a top
+	# chine (PrismMesh ridge) and bottom keel chine to give the diamond-shaped
+	# cross-section silhouette without the roundness of a cylinder.
+	# Coordinate envelope (compact): -0.95 (engines) to +1.0 (nose tip).
+
+	# Main body: flat box, slightly wider in Z than tall in Y
+	var body := MeshInstance3D.new()
+	var bodym := BoxMesh.new()
+	bodym.size = Vector3(0.75, 0.16, 0.48); bodym.material = mat_hull
+	body.mesh = bodym
+	body.position = Vector3(-0.05, -0.02, 0)
+	ship_render.add_child(body)
+
+	# Top chine — sharp triangular ridge running along the spine (point up)
+	var chine_top := MeshInstance3D.new()
+	var ctm := PrismMesh.new()
+	# Prism: size.x = base width, size.y = ridge height, size.z = length (extruded)
+	ctm.size = Vector3(0.46, 0.06, 0.70); ctm.material = mat_hull
+	chine_top.mesh = ctm
+	# Default prism point is +Y. Default length axis is Z. Rotate around Y by 90°
+	# so the length runs along ship +X instead of +Z.
+	chine_top.rotation_degrees = Vector3(0, 90, 0)
+	chine_top.position = Vector3(-0.05, 0.08, 0)
+	ship_render.add_child(chine_top)
+
+	# Bottom keel chine — mirror prism, point down
+	var chine_bot := MeshInstance3D.new()
+	var cbm := PrismMesh.new()
+	cbm.size = Vector3(0.40, 0.05, 0.70); cbm.material = mat_dark
+	chine_bot.mesh = cbm
+	chine_bot.rotation_degrees = Vector3(180, 90, 0)  # flipped to point -Y
+	chine_bot.position = Vector3(-0.05, -0.13, 0)
+	ship_render.add_child(chine_bot)
+
+	# Forward section — narrower flat box bridging body to nose
+	var fwd := MeshInstance3D.new()
+	var fwdm := BoxMesh.new()
+	fwdm.size = Vector3(0.22, 0.14, 0.32); fwdm.material = mat_hull
+	fwd.mesh = fwdm
+	fwd.position = Vector3(0.43, -0.01, 0)
+	ship_render.add_child(fwd)
+
+	# Sharp pointed nose — flat prism, low height for sleek profile
+	var nose := MeshInstance3D.new()
+	var npm := PrismMesh.new()
+	npm.size = Vector3(0.20, 0.30, 0.13); npm.material = mat_hull
+	nose.mesh = npm
+	# Lay prism flat (rotate -90° X so point originally +Y now points +Z, then
+	# rotate Y by -90° so point faces +X). Combined: rotation_degrees with Z=-90
+	# keeps the prism standing but with point along +X.
+	nose.rotation_degrees = Vector3(0, 0, -90)
+	nose.position = Vector3(0.69, 0, 0)
+	ship_render.add_child(nose)
+
+	# Pitot tube — sharp needle at the very tip
+	var pitot := MeshInstance3D.new()
+	var pitm := CylinderMesh.new()
+	pitm.top_radius = 0.006; pitm.bottom_radius = 0.010; pitm.height = 0.14
+	pitm.material = mat_dark
+	pitot.mesh = pitm
+	pitot.rotation_degrees = Vector3(0, 0, 90)
+	pitot.position = Vector3(0.91, 0, 0)
+	ship_render.add_child(pitot)
+
+	# Rear section — wider flat box housing the twin engines
+	var rear := MeshInstance3D.new()
+	var rearm := BoxMesh.new()
+	rearm.size = Vector3(0.30, 0.20, 0.55); rearm.material = mat_hull
+	rear.mesh = rearm
+	rear.position = Vector3(-0.55, -0.01, 0)
+	ship_render.add_child(rear)
+	# Engine block top chine — angled accent on rear
+	var rear_chine := MeshInstance3D.new()
+	var rcm := PrismMesh.new()
+	rcm.size = Vector3(0.50, 0.05, 0.28); rcm.material = mat_accent
+	rear_chine.mesh = rcm
+	rear_chine.rotation_degrees = Vector3(0, 90, 0)
+	rear_chine.position = Vector3(-0.55, 0.11, 0)
+	ship_render.add_child(rear_chine)
+
+	# ============================================================
+	#                  COCKPIT (angled wedge canopy)
+	# ============================================================
+	# Faceted canopy — three flat panels (front windshield, top, rear taper)
+	# instead of a rounded bubble for a more aggressive look.
+	# Position envelope: x = 0.18 .. 0.55, y = 0.07 .. 0.16
+
+	# Windshield — angled front glass panel
+	var windshield := MeshInstance3D.new()
+	var wsm := PrismMesh.new()
+	wsm.size = Vector3(0.10, 0.10, 0.22); wsm.material = mat_glass
+	windshield.mesh = wsm
+	windshield.rotation_degrees = Vector3(0, 90, 0)
+	windshield.position = Vector3(0.36, 0.09, 0)
+	ship_render.add_child(windshield)
+
+	# Main canopy — flat top glass section
+	var canopy := MeshInstance3D.new()
+	var cm := BoxMesh.new()
+	cm.size = Vector3(0.20, 0.08, 0.20); cm.material = mat_glass
+	canopy.mesh = cm
+	canopy.position = Vector3(0.25, 0.10, 0)
+	ship_render.add_child(canopy)
+
+	# Rear taper — angled back glass, opposite of windshield
+	var cock_rear := MeshInstance3D.new()
+	var crm := PrismMesh.new()
+	crm.size = Vector3(0.10, 0.08, 0.18); crm.material = mat_glass
+	cock_rear.mesh = crm
+	cock_rear.rotation_degrees = Vector3(0, -90, 0)  # mirrored vs. windshield
+	cock_rear.position = Vector3(0.14, 0.08, 0)
+	ship_render.add_child(cock_rear)
+
+	# Canopy center rib — single sharp dark seam running along the top
+	var frame := MeshInstance3D.new()
+	var fm := BoxMesh.new()
+	fm.size = Vector3(0.40, 0.018, 0.018); fm.material = mat_dark
+	frame.mesh = fm
+	frame.position = Vector3(0.25, 0.16, 0)
+	ship_render.add_child(frame)
+
+	# Cockpit interior glow — pilot HUD strip
+	var console_mat := StandardMaterial3D.new()
+	console_mat.albedo_color = Color(0.3, 0.95, 1.0)
+	console_mat.emission_enabled = true
+	console_mat.emission = Color(0.3, 0.95, 1.0)
+	console_mat.emission_energy_multiplier = 3.0
+	console_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	var console := MeshInstance3D.new()
+	var conm := BoxMesh.new()
+	conm.size = Vector3(0.16, 0.012, 0.12); conm.material = console_mat
+	console.mesh = conm
+	console.position = Vector3(0.28, 0.07, 0)
+	ship_render.add_child(console)
+	p_pulse_lights.append({"mat": console_mat, "base": 2.6, "amp": 0.7, "freq": 1.5, "phase": 0.0})
+
+	# Pilot seat hint
+	var seat := MeshInstance3D.new()
+	var stm := BoxMesh.new()
+	stm.size = Vector3(0.07, 0.08, 0.09); stm.material = mat_dark
+	seat.mesh = stm
+	seat.position = Vector3(0.22, 0.10, 0)
+	ship_render.add_child(seat)
+
+	# ============================================================
+	#                    AIR INTAKES (chin-mounted)
+	# ============================================================
+	# Compact wedge-shaped intakes flanking the lower forward fuselage.
+	for sign_v in [-1, 1]:
+		var intake := MeshInstance3D.new()
+		var intm := BoxMesh.new()
+		intm.size = Vector3(0.30, 0.12, 0.14); intm.material = mat_dark
+		intake.mesh = intm
+		intake.position = Vector3(0.20, -0.06, sign_v * 0.28)
+		intake.rotation_degrees = Vector3(0, sign_v * -8, 0)
+		ship_render.add_child(intake)
+		# Throat glow — recessed bright red bay behind the intake
+		var throat := MeshInstance3D.new()
+		var trm := BoxMesh.new()
+		trm.size = Vector3(0.03, 0.08, 0.10); trm.material = mat_intake
+		throat.mesh = trm
+		throat.position = Vector3(0.02, -0.06, sign_v * 0.28)
+		ship_render.add_child(throat)
+		# Cyan lip strip along the intake leading edge
+		var lip := MeshInstance3D.new()
+		var lm := BoxMesh.new()
+		lm.size = Vector3(0.014, 0.018, 0.14); lm.material = mat_panel_glow
+		lip.mesh = lm
+		lip.position = Vector3(0.35, 0.0, sign_v * 0.28)
+		ship_render.add_child(lip)
+
+	# ============================================================
+	#                          WINGS (swept delta, aggressive)
+	# ============================================================
+	# Sharper, shorter, more aggressively swept wings for a sporty look.
+	for sign_v in [-1, 1]:
+		var wing := MeshInstance3D.new()
+		var wm := PrismMesh.new()
+		# Root chord 0.55, tip extends 0.68 outward, thickness 0.05
+		wm.size = Vector3(0.55, 0.68, 0.05); wm.material = mat_hull
+		wing.mesh = wm
+		wing.rotation_degrees = Vector3(-90, sign_v * 90, 0)
+		wing.position = Vector3(-0.10, -0.04, sign_v * 0.40)
+		ship_render.add_child(wing)
+		# Leading-edge glow along the swept edge
+		var le := MeshInstance3D.new()
+		var lem := BoxMesh.new()
+		lem.size = Vector3(0.50, 0.020, 0.025); lem.material = mat_panel_glow
+		le.mesh = lem
+		le.position = Vector3(0.02, -0.02, sign_v * 0.55)
+		le.rotation_degrees = Vector3(0, sign_v * 42, 0)  # steeper sweep
+		ship_render.add_child(le)
+		# Wing-tip navigation light (port red / starboard green)
+		var tip := MeshInstance3D.new()
+		var tm := SphereMesh.new()
+		tm.radius = 0.05; tm.height = 0.10
+		var tmat := StandardMaterial3D.new()
+		var tip_col: Color = Color(0.3, 1.0, 0.4) if sign_v > 0 else Color(1.0, 0.3, 0.3)
+		tmat.albedo_color = tip_col
+		tmat.emission_enabled = true
+		tmat.emission = tip_col
+		tmat.emission_energy_multiplier = 5.0
+		tmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		tm.material = tmat
+		tip.mesh = tm
+		tip.position = Vector3(-0.40, -0.03, sign_v * 0.92)
+		ship_render.add_child(tip)
+		p_pulse_lights.append({"mat": tmat, "base": 4.0, "amp": 3.5, "freq": 1.8,
+			"phase": (0.0 if sign_v > 0 else PI)})
+		# Underwing hardpoint pylon
+		var pylon := MeshInstance3D.new()
+		var pym := BoxMesh.new()
+		pym.size = Vector3(0.14, 0.04, 0.05); pym.material = mat_dark
+		pylon.mesh = pym
+		pylon.position = Vector3(-0.05, -0.08, sign_v * 0.58)
+		ship_render.add_child(pylon)
+
+	# ============================================================
+	#                TWIN VERTICAL STABILIZERS (F-22 canted)
+	# ============================================================
+	# Smaller, more outward-canted than before for the aggressive look.
+	for sign_v in [-1, 1]:
+		var vstab := MeshInstance3D.new()
+		var vpm := PrismMesh.new()
+		vpm.size = Vector3(0.34, 0.34, 0.04); vpm.material = mat_hull
+		vstab.mesh = vpm
+		vstab.position = Vector3(-0.55, 0.14, sign_v * 0.20)
+		# Steeper sweep (-12°) + more outward cant (28°)
+		vstab.rotation_degrees = Vector3(0, -12, sign_v * 28)
+		ship_render.add_child(vstab)
+		# Leading-edge glow strip
+		var vfg := MeshInstance3D.new()
+		var vfgm := BoxMesh.new()
+		vfgm.size = Vector3(0.24, 0.016, 0.02); vfgm.material = mat_panel_glow
+		vfg.mesh = vfgm
+		vfg.position = Vector3(-0.45, 0.32, sign_v * 0.26)
+		vfg.rotation_degrees = Vector3(0, -12, sign_v * 28)
+		ship_render.add_child(vfg)
+
+	# ============================================================
+	#               TWIN ENGINE NOZZLES + BOOST FLAMES
+	# ============================================================
+	# Two parallel engine bells, shared material so they pulse in unison
+	# via _animate_ship_lights.
+	# Bells (dark housing, no pulsing): symmetric loop is safe
+	for sign_v in [-1, 1]:
+		var bell := MeshInstance3D.new()
+		var bellm := BoxMesh.new()
+		bellm.size = Vector3(0.20, 0.18, 0.18); bellm.material = mat_dark
+		bell.mesh = bellm
+		bell.position = Vector3(-0.78, -0.02, sign_v * 0.14)
+		ship_render.add_child(bell)
+
+	# Engine plasma glows: built EXPLICITLY per side, no loop, no array.
+	# Each has its own material AND its own mesh resource. _animate_ship_lights
+	# updates p_engine_mat_port and p_engine_mat_starboard with two separate
+	# explicit assignments — there is no shared state that could fall out of sync.
+
+	# Port (left from cockpit pov; z = -0.14 in airplane frame)
+	p_engine_mat_port = StandardMaterial3D.new()
+	p_engine_mat_port.albedo_color = Color(0.55, 0.85, 1.0)
+	p_engine_mat_port.emission_enabled = true
+	p_engine_mat_port.emission = Color(0.55, 0.85, 1.0)
+	p_engine_mat_port.emission_energy_multiplier = 5.5
+	p_engine_mat_port.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	var eg_port := MeshInstance3D.new()
+	var egm_port := SphereMesh.new()
+	egm_port.radius = 0.10
+	egm_port.height = 0.20
+	eg_port.mesh = egm_port
+	eg_port.material_override = p_engine_mat_port
+	eg_port.position = Vector3(-0.92, -0.02, -0.14)
+	ship_render.add_child(eg_port)
+
+	# Starboard (right; z = +0.14)
+	p_engine_mat_starboard = StandardMaterial3D.new()
+	p_engine_mat_starboard.albedo_color = Color(0.55, 0.85, 1.0)
+	p_engine_mat_starboard.emission_enabled = true
+	p_engine_mat_starboard.emission = Color(0.55, 0.85, 1.0)
+	p_engine_mat_starboard.emission_energy_multiplier = 5.5
+	p_engine_mat_starboard.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	var eg_starboard := MeshInstance3D.new()
+	var egm_starboard := SphereMesh.new()
+	egm_starboard.radius = 0.10
+	egm_starboard.height = 0.20
+	eg_starboard.mesh = egm_starboard
+	eg_starboard.material_override = p_engine_mat_starboard
+	eg_starboard.position = Vector3(-0.92, -0.02, 0.14)
+	ship_render.add_child(eg_starboard)
+
+	p_engine_glow = eg_starboard
+	p_engine_glow_mat = p_engine_mat_starboard
+
+	# Debug: confirm both materials are distinct instances and added to scene
+	print("[engines] port mat id=", p_engine_mat_port.get_instance_id(),
+		" starboard mat id=", p_engine_mat_starboard.get_instance_id(),
+		" port glow in tree=", eg_port.is_inside_tree(),
+		" starboard glow in tree=", eg_starboard.is_inside_tree())
+
+	# Boost flame container — twin flames, scale-driven length, shared material.
+	# Container is anchored EXACTLY at the nozzle exit (-0.88 X). Each capsule
+	# is offset rearward by half its mesh length so its front cap lands on the
+	# container origin (= nozzle), and growing the container's scale.x extends
+	# the flame only in the -X direction (out the back), never forward into
+	# the ship.
+	p_boost_flame = Node3D.new()
+	p_boost_flame.position = Vector3(-0.88, -0.02, 0)
+	p_boost_flame.scale = Vector3(0.01, 0.01, 0.01)
+	p_boost_flame.visible = false
+	ship_render.add_child(p_boost_flame)
+	var bfmat := StandardMaterial3D.new()
+	bfmat.albedo_color = Color(0.7, 0.95, 1.0, 0.85)
+	bfmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	bfmat.emission_enabled = true
+	bfmat.emission = Color(0.55, 0.85, 1.0)
+	bfmat.emission_energy_multiplier = 6.0
+	bfmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	bfmat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	p_boost_flame_mat = bfmat
+	var flame_len: float = 0.9
+	for sign_v in [-1, 1]:
+		var bf := MeshInstance3D.new()
+		var bfm := CylinderMesh.new()
+		# Cone: wide at the nozzle, tapering to a point at the rear of the flame.
+		# Top is the rear (small radius, ~point), bottom is the nozzle face.
+		bfm.top_radius = 0.005
+		bfm.bottom_radius = 0.085
+		bfm.height = flame_len
+		bfm.material = bfmat
+		bf.mesh = bfm
+		# Rotate so the cylinder's local +Y (top = rear point) becomes world -X
+		# and local -Y (bottom = wide nozzle face) becomes world +X (toward nozzle).
+		bf.rotation_degrees = Vector3(0, 0, 90)
+		# Offset rearward so the cone's wide face lands exactly on container origin
+		# (= nozzle exit at world x=-0.88).
+		bf.position = Vector3(-flame_len * 0.5, 0, sign_v * 0.14)
+		p_boost_flame.add_child(bf)
+
+	# ============================================================
+	#                    HEAT VENTS + ANTENNA
+	# ============================================================
+	# Glowing dorsal heat slots between cockpit and engines (sits on the chine)
+	for i in 3:
+		var hg := MeshInstance3D.new()
+		var hgm := BoxMesh.new()
+		hgm.size = Vector3(0.08, 0.014, 0.04); hgm.material = mat_panel_glow
+		hg.mesh = hgm
+		hg.position = Vector3(-0.10 - i * 0.13, 0.115, 0)
+		ship_render.add_child(hg)
+
+	# Short antenna stub behind canopy + warning blinker
+	var ant := MeshInstance3D.new()
+	var ancm := CylinderMesh.new()
+	ancm.top_radius = 0.008; ancm.bottom_radius = 0.018; ancm.height = 0.14
+	ancm.material = mat_dark
+	ant.mesh = ancm
+	ant.position = Vector3(0.05, 0.20, 0)
+	ship_render.add_child(ant)
+	var ant_tip := MeshInstance3D.new()
+	var atm := SphereMesh.new()
+	atm.radius = 0.018; atm.height = 0.036
+	var atmat := StandardMaterial3D.new()
+	atmat.albedo_color = Color(1.0, 0.6, 0.3)
+	atmat.emission_enabled = true
+	atmat.emission = Color(1.0, 0.55, 0.25)
+	atmat.emission_energy_multiplier = 6.0
+	atmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	atm.material = atmat
+	ant_tip.mesh = atm
+	ant_tip.position = Vector3(0.05, 0.28, 0)
+	ship_render.add_child(ant_tip)
+	p_pulse_lights.append({"mat": atmat, "base": 5.0, "amp": 4.5, "freq": 2.6, "phase": 0.0})
+
+	# ============================================================
+	#               HULL DETAIL: panel lines + nav lights
+	# ============================================================
+	# Two diagonal panel seams angling backward from cockpit (stealth look)
+	for sign_v2 in [-1, 1]:
+		var diag := MeshInstance3D.new()
+		var dgm := BoxMesh.new()
+		dgm.size = Vector3(0.42, 0.008, 0.012); dgm.material = mat_panel_line
+		diag.mesh = dgm
+		diag.position = Vector3(-0.05, 0.08, sign_v2 * 0.18)
+		diag.rotation_degrees = Vector3(0, sign_v2 * 18, 0)
+		ship_render.add_child(diag)
+
+	# Belly maneuvering thrusters (three small amber dots)
+	for x_off in [0.35, 0.0, -0.35]:
+		var thr := MeshInstance3D.new()
+		var thrm := SphereMesh.new()
+		thrm.radius = 0.030; thrm.height = 0.06
+		var thrmat := StandardMaterial3D.new()
+		thrmat.albedo_color = Color(1.0, 0.7, 0.4)
+		thrmat.emission_enabled = true
+		thrmat.emission = Color(1.0, 0.65, 0.35)
+		thrmat.emission_energy_multiplier = 3.5
+		thrmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		thrm.material = thrmat
+		thr.mesh = thrm
+		thr.position = Vector3(x_off, -0.16, 0)
+		ship_render.add_child(thr)
+
+	# Anti-collision strobes (white, fast blink)
+	var strobe_mat := StandardMaterial3D.new()
+	strobe_mat.albedo_color = Color(1.0, 1.0, 1.0)
+	strobe_mat.emission_enabled = true
+	strobe_mat.emission = Color(1.0, 1.0, 1.0)
+	strobe_mat.emission_energy_multiplier = 4.5
+	strobe_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	for i in 2:
+		var sb := MeshInstance3D.new()
+		var sbm := SphereMesh.new()
+		sbm.radius = 0.018; sbm.height = 0.036
+		sbm.material = strobe_mat
+		sb.mesh = sbm
+		sb.position = Vector3(-0.3 + i * 0.5, -0.15, 0)
+		ship_render.add_child(sb)
+	p_pulse_lights.append({"mat": strobe_mat, "base": 3.5, "amp": 4.0, "freq": 3.2, "phase": 0.0})
+
+	# Hull number plate
+	var num_mat := StandardMaterial3D.new()
+	num_mat.albedo_color = Color(0.6, 0.65, 0.78)
+	num_mat.metallic = 0.3
+	num_mat.roughness = 0.55
+	for i in 3:
+		var block := MeshInstance3D.new()
+		var bm := BoxMesh.new()
+		bm.size = Vector3(0.03, 0.004, 0.03); bm.material = num_mat
+		block.mesh = bm
+		block.position = Vector3(-0.15 + i * 0.045, 0.11, 0.18)
+		ship_render.add_child(block)
+
+	# ============================================================
+	#                     EXTRA HULL DETAILS
+	# ============================================================
+	# Side windows — rows of small glowing rectangles along the body sides.
+	# Different x positions so they don't look mechanically perfect.
+	var window_mat := StandardMaterial3D.new()
+	window_mat.albedo_color = Color(0.85, 0.95, 1.0)
+	window_mat.emission_enabled = true
+	window_mat.emission = Color(0.45, 0.85, 1.0)
+	window_mat.emission_energy_multiplier = 3.2
+	window_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	for sign_v in [-1, 1]:
+		for i in 6:
+			var win := MeshInstance3D.new()
+			var wmm := BoxMesh.new()
+			wmm.size = Vector3(0.045, 0.025, 0.012); wmm.material = window_mat
+			win.mesh = wmm
+			win.position = Vector3(-0.28 + i * 0.10, 0.02, sign_v * 0.245)
+			ship_render.add_child(win)
+		# Cockpit-area portholes (one row below the canopy)
+		for i in 3:
+			var ph := MeshInstance3D.new()
+			var phm := BoxMesh.new()
+			phm.size = Vector3(0.030, 0.020, 0.010); phm.material = window_mat
+			ph.mesh = phm
+			ph.position = Vector3(0.18 + i * 0.06, -0.02, sign_v * 0.21)
+			ship_render.add_child(ph)
+
+	# Cooling grilles — parallel thin dark strips on the upper rear (heat dump)
+	for sign_v in [-1, 1]:
+		for i in 5:
+			var grille := MeshInstance3D.new()
+			var grm := BoxMesh.new()
+			grm.size = Vector3(0.01, 0.008, 0.10); grm.material = mat_panel_line
+			grille.mesh = grm
+			grille.position = Vector3(-0.42 - i * 0.025, 0.105, sign_v * 0.16)
+			ship_render.add_child(grille)
+
+	# Hot exhaust vent slots — three glowing orange slots on either side of
+	# the rear fuselage (visible "heat dumping" while at speed).
+	var hot_vent_mat := StandardMaterial3D.new()
+	hot_vent_mat.albedo_color = Color(1.0, 0.5, 0.25)
+	hot_vent_mat.emission_enabled = true
+	hot_vent_mat.emission = Color(1.0, 0.4, 0.15)
+	hot_vent_mat.emission_energy_multiplier = 2.8
+	hot_vent_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	for sign_v in [-1, 1]:
+		for i in 3:
+			var hv := MeshInstance3D.new()
+			var hvm := BoxMesh.new()
+			hvm.size = Vector3(0.05, 0.02, 0.012); hvm.material = hot_vent_mat
+			hv.mesh = hvm
+			hv.position = Vector3(-0.45 + i * 0.07, 0.0, sign_v * 0.265)
+			ship_render.add_child(hv)
+	p_pulse_lights.append({"mat": hot_vent_mat, "base": 2.5, "amp": 0.6, "freq": 0.9, "phase": 0.6})
+
+	# Sensor domes — two small black hemispheres on the spine ahead/behind cockpit
+	for x_off in [0.62, -0.05]:
+		var sensor := MeshInstance3D.new()
+		var sphm := SphereMesh.new()
+		sphm.radius = 0.025; sphm.height = 0.05
+		sphm.material = mat_dark
+		sensor.mesh = sphm
+		sensor.position = Vector3(x_off, 0.10, 0)
+		ship_render.add_child(sensor)
+		# Tiny red LED on top of the dome
+		var led := MeshInstance3D.new()
+		var ledm := SphereMesh.new()
+		ledm.radius = 0.010; ledm.height = 0.020
+		var ledmat := StandardMaterial3D.new()
+		ledmat.albedo_color = Color(1.0, 0.3, 0.3)
+		ledmat.emission_enabled = true
+		ledmat.emission = Color(1.0, 0.25, 0.25)
+		ledmat.emission_energy_multiplier = 5.0
+		ledmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		ledm.material = ledmat
+		led.mesh = ledm
+		led.position = Vector3(x_off, 0.13, 0)
+		ship_render.add_child(led)
+
+	# Service hatches — small flat squares of darker material along the spine
+	for x_off in [0.10, -0.20, -0.40]:
+		var hatch := MeshInstance3D.new()
+		var hm := BoxMesh.new()
+		hm.size = Vector3(0.08, 0.008, 0.06); hm.material = mat_dark
+		hatch.mesh = hm
+		hatch.position = Vector3(x_off, 0.105, 0.12)
+		ship_render.add_child(hatch)
+
+	# Sub-system status LEDs — small chain of mixed-color blinkers on the spine
+	var led_colors: Array[Color] = [
+		Color(0.3, 1.0, 0.4),   # green
+		Color(0.4, 0.8, 1.0),   # cyan
+		Color(1.0, 0.85, 0.3),  # amber
+		Color(1.0, 0.4, 0.3),   # red
+	]
+	for i in 4:
+		var sled := MeshInstance3D.new()
+		var sledm := SphereMesh.new()
+		sledm.radius = 0.010; sledm.height = 0.020
+		var sledmat := StandardMaterial3D.new()
+		sledmat.albedo_color = led_colors[i]
+		sledmat.emission_enabled = true
+		sledmat.emission = led_colors[i]
+		sledmat.emission_energy_multiplier = 4.5
+		sledmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		sledm.material = sledmat
+		sled.mesh = sledm
+		sled.position = Vector3(0.34, 0.115, -0.075 + i * 0.05)
+		ship_render.add_child(sled)
+		p_pulse_lights.append({"mat": sledmat, "base": 3.5, "amp": 2.5, "freq": 2.0 + i * 0.3, "phase": i * 0.7})
+
+	# Whip antennae — two thin spikes on the rear spine (sensor mast cluster)
+	for sign_v in [-1, 1]:
+		var whip := MeshInstance3D.new()
+		var whm := CylinderMesh.new()
+		whm.top_radius = 0.003; whm.bottom_radius = 0.008; whm.height = 0.16
+		whm.material = mat_dark
+		whip.mesh = whm
+		whip.position = Vector3(-0.36, 0.20, sign_v * 0.06)
+		whip.rotation_degrees = Vector3(0, 0, sign_v * 8)  # slight outward lean
+		ship_render.add_child(whip)
+
+	# Belly emergency lights (small steady reds, no pulse)
+	for sign_v in [-1, 1]:
+		var em_light := MeshInstance3D.new()
+		var emm := SphereMesh.new()
+		emm.radius = 0.015; emm.height = 0.030
+		var emmat := StandardMaterial3D.new()
+		emmat.albedo_color = Color(1.0, 0.2, 0.2)
+		emmat.emission_enabled = true
+		emmat.emission = Color(1.0, 0.2, 0.2)
+		emmat.emission_energy_multiplier = 3.5
+		emmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		emm.material = emmat
+		em_light.mesh = emm
+		em_light.position = Vector3(-0.30, -0.14, sign_v * 0.20)
+		ship_render.add_child(em_light)
+
+	# Wing electronics box — small dark box on the upper wing root with a glow strip
+	for sign_v in [-1, 1]:
+		var ebox := MeshInstance3D.new()
+		var ebm := BoxMesh.new()
+		ebm.size = Vector3(0.10, 0.04, 0.08); ebm.material = mat_dark
+		ebox.mesh = ebm
+		ebox.position = Vector3(-0.05, 0.02, sign_v * 0.34)
+		ship_render.add_child(ebox)
+		var estrip := MeshInstance3D.new()
+		var estm := BoxMesh.new()
+		estm.size = Vector3(0.08, 0.008, 0.012); estm.material = mat_panel_glow
+		estrip.mesh = estm
+		estrip.position = Vector3(-0.05, 0.045, sign_v * 0.34)
+		ship_render.add_child(estrip)
+
+# ============================================================
+# Player update
+# ============================================================
+
+func _update_player(delta: float) -> void:
+	var dir := Vector3.ZERO
+	if Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP):    dir.y += 1
+	if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN):  dir.y -= 1
+	if Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT):  dir.x -= 1
+	if Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT): dir.x += 1
+	var input_active: float = clamp(dir.length(), 0.0, 1.0)
+	if dir.length_squared() > 0.0:
+		dir = dir.normalized()
+
+	# Boost: Shift held → drain charge for a temporary speed multiplier.
+	# Recharges from empty to full in exactly BOOST_RECHARGE_TIME seconds.
+	# `boost_depleted` latches when the tank runs dry mid-boost so the player
+	# can't stutter-boost off the recharge by simply holding Shift; they must
+	# release and re-press once charge has built back up.
+	var shift_held: bool = Input.is_key_pressed(KEY_SHIFT)
+	if not shift_held:
+		boost_depleted = false
+	var want_boost: bool = shift_held and input_active > 0.0 and not boost_depleted
+	boosting = want_boost and boost_charge > 0.0
+	if boosting:
+		boost_charge = max(0.0, boost_charge - BOOST_DRAIN_RATE * delta)
+		if boost_charge <= 0.0:
+			boost_depleted = true
+	else:
+		var rate: float = u_boost_max / BOOST_RECHARGE_TIME
+		boost_charge = min(u_boost_max, boost_charge + rate * delta)
+
+	var effective_speed: float = P_SPEED * u_speed_mult
+	if boosting:
+		effective_speed *= u_boost_strength
+	var target_vel: Vector3 = dir * effective_speed
+	# Snappier acceleration during boost so the burst is felt immediately
+	var accel: float = 22.0 if boosting else 12.0
+	p_vel = p_vel.lerp(target_vel, clamp(delta * accel, 0.0, 1.0))
+	p_pos += p_vel * delta
+	# Open space — no arena clamps. Player can fly anywhere.
+	p_node.position = p_pos
+
+	# Facing follows movement direction — player aims the ship themselves.
+	# Auto-aim no longer steers; it only fires when a target happens to be in
+	# front (see _update_fire / _nearest_enemy_in_cone).
+	if p_vel.length() > 0.5:
+		p_facing = p_vel.normalized()
+	p_node.rotation = Vector3(0, 0, atan2(p_facing.y, p_facing.x))
+
+	# Boost loop volume + pitch — both scale with remaining charge so the player
+	# can hear the tank running dry. While boost is held the volume snaps to
+	# the charge-driven target immediately (no fade-in lag); on release it
+	# fades smoothly to silence so there's no audio pop.
+	if boost_sfx != null:
+		var charge_frac: float = clamp(boost_charge / max(u_boost_max, 0.01), 0.0, 1.0)
+		# Non-linear curve: sound stays prominent through most of the boost,
+		# then drops off sharply in the last ~30% so the warning is unmistakable.
+		var fade_curve: float = pow(charge_frac, 0.55)
+		if boosting:
+			boost_db_smoothed = lerp(-28.0, -3.0, fade_curve)
+			boost_sfx.pitch_scale = lerp(0.55, 1.0, fade_curve)
+		else:
+			boost_db_smoothed = lerp(boost_db_smoothed, -80.0, clamp(delta * 14.0, 0.0, 1.0))
+			boost_sfx.pitch_scale = 1.0
+		boost_sfx.volume_db = boost_db_smoothed
+
+	# Engine loop volume — uses the *higher* of input intent and current speed
+	# so that direction switches (W→S, etc.) don't drop the sound during the
+	# velocity zero-crossing. Quieter overall than before.
+	if engine_sfx != null:
+		var max_speed: float = P_SPEED * u_speed_mult
+		var speed_norm: float = clamp(p_vel.length() / max(max_speed, 0.01), 0.0, 1.0)
+		var activity: float = max(input_active, speed_norm)
+		var target_db: float = -80.0 if activity < 0.05 else lerp(-56.0, -36.0, activity)
+		engine_db_smoothed = lerp(engine_db_smoothed, target_db, clamp(delta * 5.0, 0.0, 1.0))
+		engine_sfx.volume_db = engine_db_smoothed
+
+	# Engine glow pulse
+	if p_engine_glow != null:
+		var s: float = 1.0 + sin(run_time * 14.0) * 0.18
+		p_engine_glow.scale = Vector3(s, s, s)
+
+	# Invuln blink (only blink while invulnerable, otherwise always visible)
+	if p_invuln_timer > 0.0:
+		p_invuln_timer -= delta
+		p_node.visible = int(p_invuln_timer * 20) % 2 != 0
+	else:
+		p_node.visible = true
+
+# ============================================================
+# Enemy AI
+# ============================================================
+
+func _update_enemies(delta: float) -> void:
+	for e in enemies:
+		if e.dead:
+			continue
+		e.hit_flash = max(0.0, e.hit_flash - delta * 4.0)
+		match e.type:
+			"drone":
+				_ai_chase(e, delta, 5.0)
+			"shooter":
+				_ai_keep_distance(e, delta, 4.2, 11.0)
+				_ai_shoot(e, delta, 8, 9.5)
+			"tank":
+				_ai_chase(e, delta, 2.8)
+			"boss":
+				_ai_boss(e, delta)
+		e.pos += e.vel * delta
+		_clamp_to_arena(e)
+		if e.node != null:
+			e.node.position = e.pos
+			# Visual flash
+			if e.hit_flash > 0.0:
+				e.node.scale = Vector3.ONE * (1.0 + e.hit_flash * 0.15)
+			else:
+				e.node.scale = Vector3.ONE
+			# Slow spin for boss
+			if e.type == "boss":
+				e.node.rotation.z += delta * 1.2
+
+func _clamp_to_arena(e: Entity) -> void:
+	# Open space — enemies follow player, no hard arena boundaries
+	pass
+
+func _ai_chase(e: Entity, delta: float, speed: float) -> void:
+	var to_p: Vector3 = p_pos - e.pos
+	var d: float = to_p.length()
+	if d > 0.01:
+		e.vel = e.vel.lerp(to_p / d * speed, clamp(delta * 4.0, 0.0, 1.0))
+
+func _ai_keep_distance(e: Entity, delta: float, speed: float, ideal: float) -> void:
+	var to_p: Vector3 = p_pos - e.pos
+	var d: float = to_p.length()
+	if d < 0.01:
+		return
+	var dir: Vector3 = to_p / d
+	var target: Vector3 = dir * speed
+	if d < ideal - 1.2:
+		target = -dir * speed
+	elif d <= ideal + 1.2:
+		# Strafe perpendicular (in XY plane)
+		target = Vector3(-dir.y, dir.x, 0) * speed * 0.7
+	e.vel = e.vel.lerp(target, clamp(delta * 3.5, 0.0, 1.0))
+
+func _ai_shoot(e: Entity, delta: float, dmg: int, bullet_speed: float) -> void:
+	e.shoot_timer -= delta
+	if e.shoot_timer > 0.0:
+		return
+	e.shoot_timer = e.shoot_cd
+	var dir: Vector3 = (p_pos - e.pos).normalized()
+	_spawn_e_bullet(e.pos, dir * bullet_speed, dmg)
+
+func _ai_boss(e: Entity, delta: float) -> void:
+	_ai_keep_distance(e, delta, 3.2, 10.0)
+	e.shoot_timer -= delta
+	if e.shoot_timer > 0.0:
+		return
+	e.shoot_timer = e.shoot_cd
+	var base: Vector3 = (p_pos - e.pos).normalized()
+	var base_a: float = atan2(base.y, base.x)
+	for i in range(-1, 2):
+		var a: float = base_a + deg_to_rad(i * 14.0)
+		var v: Vector3 = Vector3(cos(a), sin(a), 0) * 11.0
+		_spawn_e_bullet(e.pos, v, 12)
+	if randf() < 0.2:
+		for i in 10:
+			var a2: float = (i / 10.0) * TAU
+			_spawn_e_bullet(e.pos, Vector3(cos(a2), sin(a2), 0) * 8.5, 8)
+
+# ============================================================
+# Bullets / gems update
+# ============================================================
+
+func _update_p_bullets(delta: float) -> void:
+	for b in p_bullets:
+		if b.dead:
+			continue
+		b.pos += b.vel * delta
+		b.lifetime -= delta
+		if b.lifetime <= 0.0 or _out_of_arena(b.pos):
+			b.dead = true
+		elif b.node != null:
+			b.node.position = b.pos
+
+func _update_e_bullets(delta: float) -> void:
+	for b in e_bullets:
+		if b.dead:
+			continue
+		b.pos += b.vel * delta
+		b.lifetime -= delta
+		if b.lifetime <= 0.0 or _out_of_arena(b.pos):
+			b.dead = true
+		elif b.node != null:
+			b.node.position = b.pos
+
+func _update_gems(delta: float) -> void:
+	var pickup_r: float = P_PICKUP_RANGE * u_pickup_mult
+	for g in gems:
+		if g.dead:
+			continue
+		g.pulse += delta
+		var to_p: Vector3 = p_pos - g.pos
+		var d: float = to_p.length()
+		if d <= pickup_r:
+			g.vel = g.vel.lerp(to_p.normalized() * 20.0 * (1.5 - d / pickup_r), clamp(delta * 8.0, 0.0, 1.0))
+		else:
+			g.vel = g.vel.lerp(Vector3.ZERO, clamp(delta * 4.0, 0.0, 1.0))
+		g.pos += g.vel * delta
+		if g.node != null:
+			g.node.position = g.pos
+			g.node.rotation.z = g.pulse * 4.0
+			var s: float = 0.9 + sin(g.pulse * 6.0) * 0.12
+			g.node.scale = Vector3(s, s, s)
+		if d <= P_RADIUS + g.radius:
+			p_xp += g.value
+			g.dead = true
+			_check_level_up()
+
+func _out_of_arena(p: Vector3) -> bool:
+	# Bullets despawn when they get too far from the player (open-space)
+	return p.distance_to(p_pos) > 35.0
+
+# ============================================================
+# Spawning
+# ============================================================
+
+func _update_spawning(delta: float) -> void:
+	spawn_timer -= delta
+	if spawn_timer > 0.0:
+		return
+	if _alive_enemy_count() >= MAX_ENEMIES:
+		spawn_timer = 0.5
+		return
+	spawn_timer = spawn_interval
+	_spawn_wave_enemy()
+
+func _alive_enemy_count() -> int:
+	var n := 0
+	for e in enemies:
+		if not e.dead:
+			n += 1
+	return n
+
+func _spawn_wave_enemy() -> void:
+	var pick := randf()
+	var kind: String
+	if wave >= 3 and pick < 0.08:
+		kind = "tank"
+	elif wave >= 2 and pick < 0.32:
+		kind = "shooter"
+	else:
+		kind = "drone"
+	_spawn_enemy(kind, _ring_pos(SPAWN_RING * u_range_mult))
+
+func _ring_pos(radius: float) -> Vector3:
+	# Spawn around player in open space (no arena clamps)
+	var ang: float = randf() * TAU
+	return p_pos + Vector3(cos(ang), sin(ang), 0) * radius
+
+func _spawn_enemy(kind: String, pos: Vector3) -> void:
+	var e := Entity.new()
+	e.type = kind
+	e.pos = pos
+	var wave_scale: float = 1.0 + (wave - 1) * 0.18
+	# Generate procedural DNA — gives variety even within same role
+	var dna := _generate_enemy_dna(kind, wave)
+	var size: float = dna["size_mult"]
+	match kind:
+		"drone":
+			e.hp = int(round(2 * wave_scale)); e.max_hp = e.hp
+			e.radius = 0.45 * size / 0.55; e.damage = 10; e.value = 1
+		"shooter":
+			e.hp = int(round(5 * wave_scale)); e.max_hp = e.hp
+			e.radius = 0.55 * size / 0.65; e.damage = 8; e.value = 3
+			e.shoot_cd = 1.8; e.shoot_timer = 1.2
+		"tank":
+			e.hp = int(round(20 * wave_scale)); e.max_hp = e.hp
+			e.radius = 0.95 * size / 1.05; e.damage = 22; e.value = 8
+		"boss":
+			e.hp = int(round(150 + wave * 25)); e.max_hp = e.hp
+			e.radius = 1.5 * size / 1.7; e.damage = 25; e.value = 50
+			e.shoot_cd = 1.0; e.shoot_timer = 1.0
+	e.node = _build_procedural_enemy(dna)
+	e.node.position = pos
+	world.add_child(e.node)
+	# 3D ambient hum for the larger enemy types — gives positional cue
+	if enemy_hum_stream != null and (kind == "tank" or kind == "boss"):
+		var hum := AudioStreamPlayer3D.new()
+		hum.stream = enemy_hum_stream
+		hum.volume_db = -6.0 if kind == "tank" else 0.0
+		hum.unit_size = 12.0 if kind == "tank" else 22.0
+		hum.max_distance = 60.0 if kind == "tank" else 100.0
+		hum.attenuation_model = AudioStreamPlayer3D.ATTENUATION_INVERSE_DISTANCE
+		hum.pitch_scale = 1.0 if kind == "tank" else 0.7  # boss sounds deeper
+		e.node.add_child(hum)
+		hum.play()
+	enemies.append(e)
+
+func _spawn_boss_wave() -> void:
+	_spawn_enemy("boss", _ring_pos(SPAWN_RING * u_range_mult * 0.6))
+
+func _make_enemy_mesh(kind: String) -> Node3D:
+	var root := Node3D.new()
+	# Tilt all enemy meshes to top-down (same convention as player ship_render)
+	var body := Node3D.new()
+	body.rotation_degrees = Vector3(90, 0, 0)
+	root.add_child(body)
+	match kind:
+		"drone":
+			_build_enemy_drone(body)
+		"shooter":
+			_build_enemy_shooter(body)
+		"tank":
+			_build_enemy_tank(body)
+		"boss":
+			_build_enemy_boss(body)
+	return root
+
+func _build_enemy_drone(body: Node3D) -> void:
+	# Hunter drone: dome core + spike ring + 4 thrusters — vertical 3D presence
+	# Central glowing core
+	var core := MeshInstance3D.new()
+	var csm := SphereMesh.new()
+	csm.radius = 0.22; csm.height = 0.44
+	var cmat := StandardMaterial3D.new()
+	cmat.albedo_color = Color(1, 0.3, 0.2)
+	cmat.emission_enabled = true
+	cmat.emission = Color(1, 0.3, 0.2)
+	cmat.emission_energy_multiplier = 4.5
+	cmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	csm.material = cmat
+	core.mesh = csm
+	core.position = Vector3(0, 0.05, 0)
+	body.add_child(core)
+	# Outer hull shell (dome top)
+	var shell := MeshInstance3D.new()
+	var shm := SphereMesh.new()
+	shm.radius = 0.34; shm.height = 0.4
+	shm.material = mat_drone
+	shell.mesh = shm
+	shell.position = Vector3(0, 0.1, 0)
+	body.add_child(shell)
+	# Bottom shell (cylinder)
+	var bottom := MeshInstance3D.new()
+	var bcm := CylinderMesh.new()
+	bcm.top_radius = 0.35; bcm.bottom_radius = 0.28; bcm.height = 0.18
+	bcm.material = mat_drone
+	bottom.mesh = bcm
+	bottom.position = Vector3(0, -0.05, 0)
+	body.add_child(bottom)
+	# Spike ring around equator (6 spikes)
+	for i in 6:
+		var ang: float = (i / 6.0) * TAU
+		var spike := MeshInstance3D.new()
+		var spm := PrismMesh.new()
+		spm.size = Vector3(0.12, 0.32, 0.1); spm.material = mat_drone
+		spike.mesh = spm
+		spike.position = Vector3(cos(ang) * 0.38, 0.05, sin(ang) * 0.38)
+		spike.rotation_degrees = Vector3(0, rad_to_deg(ang) + 90, -90)
+		body.add_child(spike)
+	# Forward sensor eye on top
+	var eye := MeshInstance3D.new()
+	var esm := SphereMesh.new()
+	esm.radius = 0.08; esm.height = 0.14
+	var emat := StandardMaterial3D.new()
+	emat.albedo_color = Color(1, 0.9, 0.4)
+	emat.emission_enabled = true
+	emat.emission = Color(1, 0.9, 0.4)
+	emat.emission_energy_multiplier = 5.0
+	emat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	esm.material = emat
+	eye.mesh = esm
+	eye.position = Vector3(0.0, 0.32, 0)
+	body.add_child(eye)
+	# 4 corner thrusters underneath
+	for i in 4:
+		var ang: float = (i / 4.0) * TAU + PI / 4
+		var thr := MeshInstance3D.new()
+		var tsm := SphereMesh.new()
+		tsm.radius = 0.07; tsm.height = 0.14
+		var tmat := StandardMaterial3D.new()
+		tmat.albedo_color = Color(1, 0.55, 0.25)
+		tmat.emission_enabled = true
+		tmat.emission = Color(1, 0.55, 0.25)
+		tmat.emission_energy_multiplier = 4.0
+		tmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		tsm.material = tmat
+		thr.mesh = tsm
+		thr.position = Vector3(cos(ang) * 0.22, -0.18, sin(ang) * 0.22)
+		body.add_child(thr)
+
+func _build_enemy_shooter(body: Node3D) -> void:
+	# Raptor-class ranged fighter: forward-swept body + 3 cannons + twin engines
+	# Main hull (tapered)
+	var hull := MeshInstance3D.new()
+	var hm := BoxMesh.new()
+	hm.size = Vector3(0.95, 0.32, 0.55); hm.material = mat_shooter
+	hull.mesh = hm
+	body.add_child(hull)
+	# Lower keel
+	var keel := MeshInstance3D.new()
+	var km := BoxMesh.new()
+	km.size = Vector3(0.7, 0.1, 0.3); km.material = _mat_metal(Color(0.5, 0.35, 0.15))
+	keel.mesh = km
+	keel.position = Vector3(0, -0.2, 0)
+	body.add_child(keel)
+	# Forward cockpit dome (orange glass)
+	var cockpit := MeshInstance3D.new()
+	var dm := SphereMesh.new()
+	dm.radius = 0.16; dm.height = 0.22
+	var cmat := StandardMaterial3D.new()
+	cmat.albedo_color = Color(0.12, 0.08, 0.05)
+	cmat.emission_enabled = true
+	cmat.emission = Color(1, 0.6, 0.2)
+	cmat.emission_energy_multiplier = 3.0
+	cmat.metallic = 0.9; cmat.roughness = 0.1
+	dm.material = cmat
+	cockpit.mesh = dm
+	cockpit.position = Vector3(0.32, 0.22, 0)
+	body.add_child(cockpit)
+	# Forward-swept wings
+	for sign_v in [-1, 1]:
+		var wing := MeshInstance3D.new()
+		var wm := BoxMesh.new()
+		wm.size = Vector3(0.55, 0.08, 0.45); wm.material = mat_shooter
+		wing.mesh = wm
+		wing.position = Vector3(-0.05, -0.02, sign_v * 0.5)
+		wing.rotation_degrees = Vector3(0, sign_v * -25, 0)
+		body.add_child(wing)
+		# Wing-mounted gun pod
+		var pod := MeshInstance3D.new()
+		var pbm := BoxMesh.new()
+		pbm.size = Vector3(0.25, 0.12, 0.15); pbm.material = _mat_metal(Color(0.45, 0.32, 0.15))
+		pod.mesh = pbm
+		pod.position = Vector3(0.18, -0.04, sign_v * 0.66)
+		body.add_child(pod)
+		# Gun barrel out front of pod
+		var barrel := MeshInstance3D.new()
+		var bcm := CylinderMesh.new()
+		bcm.top_radius = 0.04; bcm.bottom_radius = 0.05; bcm.height = 0.4
+		bcm.material = _mat_metal(Color(0.3, 0.2, 0.1))
+		barrel.mesh = bcm
+		barrel.position = Vector3(0.45, -0.04, sign_v * 0.66)
+		barrel.rotation_degrees = Vector3(0, 0, 90)
+		body.add_child(barrel)
+	# Top central cannon (bigger)
+	var top_cannon := MeshInstance3D.new()
+	var tcm := CylinderMesh.new()
+	tcm.top_radius = 0.06; tcm.bottom_radius = 0.08; tcm.height = 0.55
+	tcm.material = _mat_metal(Color(0.4, 0.3, 0.15))
+	top_cannon.mesh = tcm
+	top_cannon.position = Vector3(0.32, 0.32, 0)
+	top_cannon.rotation_degrees = Vector3(0, 0, 90)
+	body.add_child(top_cannon)
+	# Dorsal heat fin
+	var fin := MeshInstance3D.new()
+	var fm := PrismMesh.new()
+	fm.size = Vector3(0.32, 0.35, 0.05); fm.material = mat_shooter
+	fin.mesh = fm
+	fin.position = Vector3(-0.25, 0.28, 0)
+	body.add_child(fin)
+	# Twin engine nacelles
+	for sign_v in [-1, 1]:
+		var nac := MeshInstance3D.new()
+		var ncm := CylinderMesh.new()
+		ncm.top_radius = 0.13; ncm.bottom_radius = 0.15; ncm.height = 0.45
+		ncm.material = _mat_metal(Color(0.4, 0.3, 0.15))
+		nac.mesh = ncm
+		nac.position = Vector3(-0.42, -0.05, sign_v * 0.25)
+		nac.rotation_degrees = Vector3(0, 0, 90)
+		body.add_child(nac)
+		# Nacelle exhaust glow
+		var glow := MeshInstance3D.new()
+		var gm := SphereMesh.new()
+		gm.radius = 0.13; gm.height = 0.26
+		var gmat := StandardMaterial3D.new()
+		gmat.albedo_color = Color(1, 0.55, 0.2)
+		gmat.emission_enabled = true
+		gmat.emission = Color(1, 0.55, 0.2)
+		gmat.emission_energy_multiplier = 4.5
+		gmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		gm.material = gmat
+		glow.mesh = gm
+		glow.position = Vector3(-0.7, -0.05, sign_v * 0.25)
+		body.add_child(glow)
+
+func _build_enemy_tank(body: Node3D) -> void:
+	# Fortress tank: layered hex body + 4 corner thrusters + central rotating turret
+	# Hexagonal base hull (use 6-segment cylinder)
+	var base := MeshInstance3D.new()
+	var bcm := CylinderMesh.new()
+	bcm.top_radius = 0.95; bcm.bottom_radius = 1.1; bcm.height = 0.32
+	bcm.radial_segments = 6
+	bcm.material = mat_tank
+	base.mesh = bcm
+	base.position = Vector3(0, -0.18, 0)
+	body.add_child(base)
+	# Upper hull (smaller hex)
+	var upper := MeshInstance3D.new()
+	var ucm := CylinderMesh.new()
+	ucm.top_radius = 0.6; ucm.bottom_radius = 0.85; ucm.height = 0.3
+	ucm.radial_segments = 6
+	ucm.material = _mat_metal(Color(0.7, 0.3, 0.55))
+	upper.mesh = ucm
+	upper.position = Vector3(0, 0.1, 0)
+	body.add_child(upper)
+	# Side armor wedges (4 around hull)
+	for i in 4:
+		var ang: float = (i / 4.0) * TAU + PI / 4
+		var armor := MeshInstance3D.new()
+		var am := BoxMesh.new()
+		am.size = Vector3(0.45, 0.4, 0.25); am.material = _mat_metal(Color(0.6, 0.25, 0.5))
+		armor.mesh = am
+		armor.position = Vector3(cos(ang) * 0.85, -0.1, sin(ang) * 0.85)
+		armor.rotation_degrees = Vector3(0, rad_to_deg(ang) + 90, 0)
+		body.add_child(armor)
+	# Central rotating turret (visible chunky block)
+	var turret := MeshInstance3D.new()
+	var tm := BoxMesh.new()
+	tm.size = Vector3(0.55, 0.32, 0.45); tm.material = mat_tank
+	turret.mesh = tm
+	turret.position = Vector3(0, 0.45, 0)
+	body.add_child(turret)
+	# Triple cannon array (3 barrels from turret)
+	for i in 3:
+		var off: float = (i - 1) * 0.12
+		var barrel := MeshInstance3D.new()
+		var brm := CylinderMesh.new()
+		brm.top_radius = 0.06; brm.bottom_radius = 0.08; brm.height = 0.55
+		brm.material = _mat_metal(Color(0.3, 0.15, 0.25))
+		barrel.mesh = brm
+		barrel.position = Vector3(0.45, 0.45, off)
+		barrel.rotation_degrees = Vector3(0, 0, 90)
+		body.add_child(barrel)
+	# Red command eye on top
+	var eye := MeshInstance3D.new()
+	var esm := SphereMesh.new()
+	esm.radius = 0.13; esm.height = 0.22
+	var emat := StandardMaterial3D.new()
+	emat.albedo_color = Color(1, 0.15, 0.35)
+	emat.emission_enabled = true
+	emat.emission = Color(1, 0.15, 0.35)
+	emat.emission_energy_multiplier = 5.5
+	emat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	esm.material = emat
+	eye.mesh = esm
+	eye.position = Vector3(0, 0.62, 0)
+	body.add_child(eye)
+	# 4 corner thruster pods
+	for i in 4:
+		var ang: float = (i / 4.0) * TAU + PI / 4
+		var pod := MeshInstance3D.new()
+		var pcm := CylinderMesh.new()
+		pcm.top_radius = 0.13; pcm.bottom_radius = 0.16; pcm.height = 0.35
+		pcm.material = _mat_metal(Color(0.45, 0.2, 0.4))
+		pod.mesh = pcm
+		pod.position = Vector3(cos(ang) * 0.75, -0.3, sin(ang) * 0.75)
+		pod.rotation_degrees = Vector3(90, 0, 0)
+		body.add_child(pod)
+		# Engine glow at bottom of pod
+		var glow := MeshInstance3D.new()
+		var gsm := SphereMesh.new()
+		gsm.radius = 0.13; gsm.height = 0.26
+		var gmat := StandardMaterial3D.new()
+		gmat.albedo_color = Color(1, 0.35, 0.7)
+		gmat.emission_enabled = true
+		gmat.emission = Color(1, 0.35, 0.7)
+		gmat.emission_energy_multiplier = 4.5
+		gmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		gsm.material = gmat
+		glow.mesh = gsm
+		glow.position = Vector3(cos(ang) * 0.75, -0.5, sin(ang) * 0.75)
+		body.add_child(glow)
+	# Antenna spikes on top corners
+	for sign_v in [-1, 1]:
+		var ant := MeshInstance3D.new()
+		var acm := CylinderMesh.new()
+		acm.top_radius = 0.015; acm.bottom_radius = 0.04; acm.height = 0.4
+		acm.material = _mat_metal(Color(0.5, 0.25, 0.45))
+		ant.mesh = acm
+		ant.position = Vector3(-0.35, 0.55, sign_v * 0.25)
+		body.add_child(ant)
+
+func _build_enemy_boss(body: Node3D) -> void:
+	# Massive dreadnought: layered spine + command tower + 6 weapon arms + ring + multiple engines
+	# Lower hull (large flat plate)
+	var lower := MeshInstance3D.new()
+	var lm := BoxMesh.new()
+	lm.size = Vector3(2.4, 0.4, 1.5); lm.material = _mat_metal(Color(0.5, 0.2, 0.55))
+	lower.mesh = lm
+	lower.position = Vector3(0, -0.25, 0)
+	body.add_child(lower)
+	# Mid spine
+	var spine := MeshInstance3D.new()
+	var sm := BoxMesh.new()
+	sm.size = Vector3(2.6, 0.55, 1.0); sm.material = mat_boss
+	spine.mesh = sm
+	body.add_child(spine)
+	# Upper command tower (3-tier)
+	var tower1 := MeshInstance3D.new()
+	var t1m := BoxMesh.new()
+	t1m.size = Vector3(1.4, 0.3, 0.7); t1m.material = _mat_metal(Color(0.7, 0.3, 0.7))
+	tower1.mesh = t1m
+	tower1.position = Vector3(0.1, 0.4, 0)
+	body.add_child(tower1)
+	var tower2 := MeshInstance3D.new()
+	var t2m := BoxMesh.new()
+	t2m.size = Vector3(0.9, 0.35, 0.55); t2m.material = mat_boss
+	tower2.mesh = t2m
+	tower2.position = Vector3(0.25, 0.72, 0)
+	body.add_child(tower2)
+	# Bridge dome (glowing brain)
+	var dome := MeshInstance3D.new()
+	var dsm := SphereMesh.new()
+	dsm.radius = 0.32; dsm.height = 0.5
+	var dmat := StandardMaterial3D.new()
+	dmat.albedo_color = Color(0.12, 0.05, 0.18)
+	dmat.emission_enabled = true
+	dmat.emission = Color(1, 0.3, 1)
+	dmat.emission_energy_multiplier = 4.0
+	dmat.metallic = 0.95; dmat.roughness = 0.05
+	dsm.material = dmat
+	dome.mesh = dsm
+	dome.position = Vector3(0.4, 0.95, 0)
+	body.add_child(dome)
+	# Bridge "eye" beam center
+	var eye := MeshInstance3D.new()
+	var esm := SphereMesh.new()
+	esm.radius = 0.12; esm.height = 0.2
+	var emat := StandardMaterial3D.new()
+	emat.albedo_color = Color(1, 0.4, 1)
+	emat.emission_enabled = true
+	emat.emission = Color(1, 0.4, 1)
+	emat.emission_energy_multiplier = 6.5
+	emat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	esm.material = emat
+	eye.mesh = esm
+	eye.position = Vector3(0.65, 0.95, 0)
+	body.add_child(eye)
+	# 6 weapon arms (3 per side)
+	var arm_offsets := [Vector3(0.7, 0, 0), Vector3(-0.1, 0, 0), Vector3(-0.6, 0, 0)]
+	for sign_v in [-1, 1]:
+		for arm_pos in arm_offsets:
+			var arm := MeshInstance3D.new()
+			var am := BoxMesh.new()
+			am.size = Vector3(0.55, 0.2, 0.4); am.material = mat_boss
+			arm.mesh = am
+			arm.position = Vector3(arm_pos.x, -0.05, sign_v * 0.85)
+			body.add_child(arm)
+			# Twin barrel on this arm
+			for off in [-0.07, 0.07]:
+				var barrel := MeshInstance3D.new()
+				var brm := CylinderMesh.new()
+				brm.top_radius = 0.04; brm.bottom_radius = 0.06; brm.height = 0.4
+				brm.material = _mat_metal(Color(0.3, 0.1, 0.3))
+				barrel.mesh = brm
+				barrel.position = Vector3(arm_pos.x + 0.4, -0.05, sign_v * 0.85 + off)
+				barrel.rotation_degrees = Vector3(0, 0, 90)
+				body.add_child(barrel)
+	# Side wing extensions (2 per side)
+	for sign_v in [-1, 1]:
+		var wing := MeshInstance3D.new()
+		var wm := BoxMesh.new()
+		wm.size = Vector3(1.7, 0.18, 0.4); wm.material = _mat_metal(Color(0.55, 0.22, 0.55))
+		wing.mesh = wm
+		wing.position = Vector3(-0.15, 0.05, sign_v * 1.15)
+		body.add_child(wing)
+		# Wing tip cone glow
+		var tip := MeshInstance3D.new()
+		var tsm := SphereMesh.new()
+		tsm.radius = 0.16; tsm.height = 0.32
+		var tmat := StandardMaterial3D.new()
+		tmat.albedo_color = Color(1, 0.3, 1)
+		tmat.emission_enabled = true
+		tmat.emission = Color(1, 0.3, 1)
+		tmat.emission_energy_multiplier = 5.0
+		tmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		tsm.material = tmat
+		tip.mesh = tsm
+		tip.position = Vector3(-1.0, 0.05, sign_v * 1.35)
+		body.add_child(tip)
+	# 3 central main engines at rear
+	for off in [-0.4, 0, 0.4]:
+		var ring := MeshInstance3D.new()
+		var rcm := CylinderMesh.new()
+		rcm.top_radius = 0.22; rcm.bottom_radius = 0.18; rcm.height = 0.25
+		rcm.material = _mat_metal(Color(0.3, 0.15, 0.35))
+		ring.mesh = rcm
+		ring.position = Vector3(-1.3, 0, off)
+		ring.rotation_degrees = Vector3(0, 0, 90)
+		body.add_child(ring)
+		var glow := MeshInstance3D.new()
+		var gsm := SphereMesh.new()
+		gsm.radius = 0.2; gsm.height = 0.4
+		var gmat := StandardMaterial3D.new()
+		gmat.albedo_color = Color(1, 0.45, 1)
+		gmat.emission_enabled = true
+		gmat.emission = Color(1, 0.45, 1)
+		gmat.emission_energy_multiplier = 5.5
+		gmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		gsm.material = gmat
+		glow.mesh = gsm
+		glow.position = Vector3(-1.55, 0, off)
+		body.add_child(glow)
+	# Forward ramming spike
+	var spike := MeshInstance3D.new()
+	var pm := PrismMesh.new()
+	pm.size = Vector3(0.45, 0.7, 0.45); pm.material = mat_boss
+	spike.mesh = pm
+	spike.position = Vector3(1.65, -0.05, 0)
+	spike.rotation_degrees = Vector3(0, 0, -90)
+	body.add_child(spike)
+	# Dorsal antenna spire
+	var spire := MeshInstance3D.new()
+	var spm := CylinderMesh.new()
+	spm.top_radius = 0.02; spm.bottom_radius = 0.06; spm.height = 0.8
+	spm.material = mat_boss
+	spire.mesh = spm
+	spire.position = Vector3(-0.7, 0.85, 0)
+	body.add_child(spire)
+	var spire_tip := MeshInstance3D.new()
+	var stsm := SphereMesh.new()
+	stsm.radius = 0.08; stsm.height = 0.16
+	var stmat := StandardMaterial3D.new()
+	stmat.albedo_color = Color(1, 0.5, 1)
+	stmat.emission_enabled = true
+	stmat.emission = Color(1, 0.5, 1)
+	stmat.emission_energy_multiplier = 5.5
+	stmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	stsm.material = stmat
+	spire_tip.mesh = stsm
+	spire_tip.position = Vector3(-0.7, 1.3, 0)
+	body.add_child(spire_tip)
+
+# ============================================================
+# Procedural enemy generation
+# ============================================================
+
+const PALETTES := [
+	{"hull": Color(0.92, 0.42, 0.32), "eye": Color(1.0, 0.3, 0.2),  "engine": Color(1.0, 0.5, 0.25), "name": "rot"},
+	{"hull": Color(1.0, 0.7, 0.25),   "eye": Color(1.0, 0.9, 0.3),  "engine": Color(1.0, 0.55, 0.2), "name": "amber"},
+	{"hull": Color(0.85, 0.35, 0.7),  "eye": Color(1.0, 0.4, 0.85), "engine": Color(1.0, 0.35, 0.95),"name": "rosa"},
+	{"hull": Color(0.55, 0.3, 0.85),  "eye": Color(0.8, 0.5, 1.0),  "engine": Color(0.7, 0.4, 1.0),  "name": "violett"},
+	{"hull": Color(0.4, 0.85, 0.5),   "eye": Color(0.6, 1.0, 0.4),  "engine": Color(0.5, 1.0, 0.7),  "name": "toxic"},
+	{"hull": Color(0.4, 0.75, 0.9),   "eye": Color(0.6, 1.0, 1.0),  "engine": Color(0.5, 0.95, 1.0), "name": "eis"},
+	{"hull": Color(0.78, 0.78, 0.85), "eye": Color(1.0, 0.9, 0.7),  "engine": Color(1.0, 0.8, 0.6),  "name": "asche"},
+	{"hull": Color(0.4, 0.5, 0.65),   "eye": Color(0.5, 0.95, 1.0), "engine": Color(0.6, 0.85, 1.0), "name": "stahl"},
+]
+
+const HULL_SHAPES := ["box", "elongated", "hex", "diamond", "sphere", "twin", "stacked"]
+const WING_TYPES := ["none", "swept", "back_swept", "delta", "x_pattern", "small_fins"]
+const WEAPON_TYPES := ["none", "single", "twin", "triple", "pod_array", "missile_rack", "turret_array", "boss_arms"]
+
+func _make_proc_hull_mat(c: Color) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = c
+	m.metallic = 0.85
+	m.roughness = 0.32
+	m.metallic_specular = 0.6
+	# Very subtle emission so unlit side isn't pitch black
+	m.emission_enabled = true
+	m.emission = c
+	m.emission_energy_multiplier = 0.08
+	return m
+
+func _make_proc_glow_mat(c: Color, energy: float) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = c
+	m.emission_enabled = true
+	m.emission = c
+	m.emission_energy_multiplier = energy
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	return m
+
+func _generate_enemy_dna(role: String, level: int) -> Dictionary:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = randi()
+	var dna := {"role": role, "level": level}
+	var pal_idx: int = (level / 2 + rng.randi() % 2) % PALETTES.size()
+	dna["palette"] = PALETTES[pal_idx]
+	var size_mult: float = 1.0
+	var hull_opts: Array = ["box"]
+	var wing_opts: Array = ["none"]
+	var weapon_opts: Array = ["none"]
+	var eng_count: int = 1
+	var detail: int = 1
+	match role:
+		"drone":
+			size_mult = rng.randf_range(0.45, 0.6)
+			hull_opts = ["box", "diamond", "hex", "sphere"]
+			wing_opts = ["none", "swept", "small_fins"]
+			eng_count = rng.randi_range(1, 4)
+			detail = 1
+		"shooter":
+			size_mult = rng.randf_range(0.6, 0.75)
+			hull_opts = ["box", "elongated", "twin", "stacked"]
+			wing_opts = ["swept", "back_swept", "delta", "small_fins"]
+			weapon_opts = ["single", "twin", "pod_array"]
+			eng_count = rng.randi_range(2, 3)
+			detail = 2
+		"tank":
+			size_mult = rng.randf_range(0.95, 1.2)
+			hull_opts = ["box", "hex", "stacked"]
+			wing_opts = ["none", "small_fins"]
+			weapon_opts = ["twin", "triple", "missile_rack", "turret_array"]
+			eng_count = rng.randi_range(2, 4)
+			detail = 3
+		"boss":
+			size_mult = rng.randf_range(1.5, 2.1)
+			hull_opts = ["elongated", "stacked", "twin"]
+			wing_opts = ["swept", "x_pattern", "delta"]
+			weapon_opts = ["triple", "missile_rack", "turret_array", "boss_arms"]
+			eng_count = rng.randi_range(3, 5)
+			detail = 5
+	size_mult *= 1.0 + (level - 1) * 0.025
+	dna["size_mult"] = size_mult
+	dna["hull_shape"] = hull_opts[rng.randi() % hull_opts.size()]
+	dna["wing_type"] = wing_opts[rng.randi() % wing_opts.size()]
+	dna["weapon_type"] = weapon_opts[rng.randi() % weapon_opts.size()]
+	dna["engine_count"] = eng_count
+	dna["detail_density"] = detail
+	dna["eye_count"] = 1 + (1 if rng.randf() < 0.45 else 0) + (level / 4)
+	dna["has_dome"] = (role == "boss") or (role == "tank" and rng.randf() < 0.5) or (role == "shooter" and rng.randf() < 0.3)
+	dna["antenna_count"] = rng.randi_range(0, 1 + detail)
+	dna["spike_count"] = 0 if role == "drone" else rng.randi() % 8
+	dna["height_layers"] = rng.randi_range(1, 3) if detail >= 2 else 1
+	dna["armor_count"] = rng.randi() % (detail + 1)
+	return dna
+
+func _build_procedural_enemy(dna: Dictionary) -> Node3D:
+	var root := Node3D.new()
+	var body := Node3D.new()
+	body.rotation_degrees = Vector3(90, 0, 0)
+	root.add_child(body)
+	var pal: Dictionary = dna["palette"]
+	var hull_col: Color = pal["hull"]
+	var eye_col: Color = pal["eye"]
+	var eng_col: Color = pal["engine"]
+	var s: float = dna["size_mult"]
+	var hull_mat := _make_proc_hull_mat(hull_col)
+	var dark_mat := _make_proc_hull_mat(hull_col.darkened(0.35))
+	var eye_mat := _make_proc_glow_mat(eye_col, 5.5)
+	var eng_mat := _make_proc_glow_mat(eng_col, 4.5)
+	var extents: Vector3 = _build_proc_hull(body, dna["hull_shape"], s, hull_mat, dark_mat, dna["height_layers"])
+	if dna["wing_type"] != "none":
+		_build_proc_wings(body, dna["wing_type"], extents, s, hull_mat, eye_col)
+	if dna["weapon_type"] != "none":
+		_build_proc_weapons(body, dna["weapon_type"], extents, s, hull_mat, dark_mat, eye_mat)
+	_build_proc_engines(body, dna["engine_count"], extents, s, dark_mat, eng_mat)
+	_build_proc_eyes(body, dna["eye_count"], extents, s, eye_mat)
+	if dna["has_dome"]:
+		_build_proc_dome(body, extents, s, hull_col, eye_col)
+	for i in dna["antenna_count"]:
+		_build_proc_antenna(body, i, dna["antenna_count"], extents, s, dark_mat, eye_mat)
+	if dna["spike_count"] > 0:
+		_build_proc_spikes(body, dna["spike_count"], extents, s, hull_mat)
+	for i in dna["armor_count"]:
+		_build_proc_armor(body, i, dna["armor_count"], extents, s, hull_col)
+	# Bigger enemies emit a tinted point light from their eyes/engines so the
+	# player ship gets lit when one approaches. Small drones stay light-free to
+	# keep total light count manageable.
+	if s >= 1.05:
+		var el := OmniLight3D.new()
+		el.light_color = eye_col
+		el.light_energy = 1.4 + (s - 1.0) * 2.0
+		el.omni_range = 4.0 + s * 2.0
+		el.omni_attenuation = 1.6
+		root.add_child(el)
+	return root
+
+func _build_proc_hull(body: Node3D, shape: String, s: float, hull_mat: StandardMaterial3D, dark_mat: StandardMaterial3D, layers: int) -> Vector3:
+	match shape:
+		"box":
+			var size := Vector3(0.9, 0.35, 0.7) * s
+			var h := MeshInstance3D.new()
+			var bm := BoxMesh.new(); bm.size = size; bm.material = hull_mat
+			h.mesh = bm
+			body.add_child(h)
+			return size * 0.5
+		"elongated":
+			var size := Vector3(1.4, 0.32, 0.6) * s
+			var h := MeshInstance3D.new()
+			var bm := BoxMesh.new(); bm.size = size; bm.material = hull_mat
+			h.mesh = bm
+			body.add_child(h)
+			# Mid spine accent
+			var spine := MeshInstance3D.new()
+			var sbm := BoxMesh.new(); sbm.size = Vector3(size.x * 0.8, size.y * 0.5, size.z * 0.3); sbm.material = dark_mat
+			spine.mesh = sbm; spine.position = Vector3(0, size.y * 0.55, 0)
+			body.add_child(spine)
+			return size * 0.5
+		"hex":
+			var radius := 0.55 * s
+			var height := 0.4 * s
+			var h := MeshInstance3D.new()
+			var cm := CylinderMesh.new(); cm.top_radius = radius; cm.bottom_radius = radius * 1.1; cm.height = height; cm.radial_segments = 6
+			cm.material = hull_mat
+			h.mesh = cm
+			body.add_child(h)
+			return Vector3(radius * 1.1, height * 0.5, radius * 1.1)
+		"diamond":
+			var size := Vector3(0.85, 0.4, 0.7) * s
+			var top := MeshInstance3D.new()
+			var tpm := PrismMesh.new(); tpm.size = size; tpm.material = hull_mat
+			top.mesh = tpm
+			body.add_child(top)
+			# Mirror bottom prism for full diamond
+			var bot := MeshInstance3D.new()
+			var bpm := PrismMesh.new(); bpm.size = size; bpm.material = hull_mat
+			bot.mesh = bpm; bot.rotation_degrees = Vector3(180, 0, 0)
+			body.add_child(bot)
+			return size * 0.5
+		"sphere":
+			var radius := 0.45 * s
+			var h := MeshInstance3D.new()
+			var sm := SphereMesh.new(); sm.radius = radius; sm.height = radius * 2
+			sm.material = hull_mat
+			h.mesh = sm
+			body.add_child(h)
+			return Vector3(radius, radius, radius)
+		"twin":
+			var size := Vector3(0.7, 0.3, 0.35) * s
+			for sign_v in [-1, 1]:
+				var h := MeshInstance3D.new()
+				var bm := BoxMesh.new(); bm.size = size; bm.material = hull_mat
+				h.mesh = bm; h.position = Vector3(0, 0, sign_v * size.z * 1.05)
+				body.add_child(h)
+			# Connecting bridge
+			var bridge := MeshInstance3D.new()
+			var bbm := BoxMesh.new(); bbm.size = Vector3(size.x * 0.6, size.y * 0.5, size.z * 2.0); bbm.material = dark_mat
+			bridge.mesh = bbm
+			body.add_child(bridge)
+			return Vector3(size.x * 0.5, size.y * 0.5, size.z * 1.5)
+		"stacked":
+			var w := 0.7 * s
+			var d := 0.55 * s
+			var tot_h := 0.0
+			for i in maxi(1, layers):
+				var layer_h := (0.3 - i * 0.04) * s
+				var layer_w := w * (1.0 - i * 0.15)
+				var layer_d := d * (1.0 - i * 0.15)
+				var h := MeshInstance3D.new()
+				var bm := BoxMesh.new(); bm.size = Vector3(layer_w, layer_h, layer_d); bm.material = hull_mat if i % 2 == 0 else dark_mat
+				h.mesh = bm
+				h.position = Vector3(0, tot_h + layer_h * 0.5, 0)
+				body.add_child(h)
+				tot_h += layer_h
+			return Vector3(w * 0.5, tot_h * 0.5, d * 0.5)
+	return Vector3(0.4, 0.2, 0.35) * s
+
+func _build_proc_wings(body: Node3D, wing_type: String, ext: Vector3, s: float, hull_mat: StandardMaterial3D, eye_col: Color) -> void:
+	var tip_mat := _make_proc_glow_mat(eye_col, 4.0)
+	match wing_type:
+		"swept":
+			for sign_v in [-1, 1]:
+				var w := MeshInstance3D.new()
+				var bm := BoxMesh.new(); bm.size = Vector3(0.5 * s, 0.06 * s, 0.5 * s); bm.material = hull_mat
+				w.mesh = bm
+				w.position = Vector3(-ext.x * 0.3, 0, sign_v * (ext.z + 0.25 * s))
+				w.rotation_degrees = Vector3(0, sign_v * 20, 0)
+				body.add_child(w)
+				_add_wing_tip(body, w.position + Vector3(-0.18 * s, 0, sign_v * 0.18 * s), 0.05 * s, tip_mat)
+		"back_swept":
+			for sign_v in [-1, 1]:
+				var w := MeshInstance3D.new()
+				var bm := BoxMesh.new(); bm.size = Vector3(0.45 * s, 0.06 * s, 0.55 * s); bm.material = hull_mat
+				w.mesh = bm
+				w.position = Vector3(ext.x * 0.2, 0, sign_v * (ext.z + 0.28 * s))
+				w.rotation_degrees = Vector3(0, sign_v * -22, 0)
+				body.add_child(w)
+				_add_wing_tip(body, w.position + Vector3(0.18 * s, 0, sign_v * 0.18 * s), 0.05 * s, tip_mat)
+		"delta":
+			for sign_v in [-1, 1]:
+				var w := MeshInstance3D.new()
+				var pm := PrismMesh.new(); pm.size = Vector3(0.6 * s, 0.55 * s, 0.06 * s); pm.material = hull_mat
+				w.mesh = pm
+				w.position = Vector3(-ext.x * 0.4, 0, sign_v * (ext.z + 0.3 * s))
+				w.rotation_degrees = Vector3(90, sign_v * 25, 0)
+				body.add_child(w)
+		"x_pattern":
+			for diag in [Vector2(1,1), Vector2(1,-1), Vector2(-1,1), Vector2(-1,-1)]:
+				var w := MeshInstance3D.new()
+				var bm := BoxMesh.new(); bm.size = Vector3(0.55 * s, 0.06 * s, 0.4 * s); bm.material = hull_mat
+				w.mesh = bm
+				w.position = Vector3(diag.x * ext.x * 0.5, 0, diag.y * (ext.z + 0.2 * s))
+				w.rotation_degrees = Vector3(0, rad_to_deg(atan2(diag.y, diag.x)) - (90 if diag.x > 0 else -90), 0)
+				body.add_child(w)
+				_add_wing_tip(body, w.position + Vector3(0, 0, diag.y * 0.12 * s), 0.05 * s, tip_mat)
+		"small_fins":
+			for sign_v in [-1, 1]:
+				var f := MeshInstance3D.new()
+				var pm := PrismMesh.new(); pm.size = Vector3(0.22 * s, 0.18 * s, 0.04 * s); pm.material = hull_mat
+				f.mesh = pm
+				f.position = Vector3(-ext.x * 0.4, ext.y * 0.6, sign_v * ext.z * 0.5)
+				f.rotation_degrees = Vector3(0, sign_v * 25, 0)
+				body.add_child(f)
+
+func _add_wing_tip(body: Node3D, pos: Vector3, r: float, mat: StandardMaterial3D) -> void:
+	var tip := MeshInstance3D.new()
+	var sm := SphereMesh.new(); sm.radius = r; sm.height = r * 2
+	sm.material = mat
+	tip.mesh = sm
+	tip.position = pos
+	body.add_child(tip)
+
+func _build_proc_weapons(body: Node3D, wtype: String, ext: Vector3, s: float, hull_mat: StandardMaterial3D, dark_mat: StandardMaterial3D, glow_mat: StandardMaterial3D) -> void:
+	match wtype:
+		"single":
+			_add_barrel(body, Vector3(ext.x + 0.3 * s, ext.y * 0.5, 0), 0.4 * s, 0.07 * s, dark_mat, glow_mat)
+		"twin":
+			for sign_v in [-1, 1]:
+				_add_barrel(body, Vector3(ext.x + 0.25 * s, 0, sign_v * ext.z * 0.45), 0.4 * s, 0.06 * s, dark_mat, glow_mat)
+		"triple":
+			for off in [-0.18 * s, 0, 0.18 * s]:
+				_add_barrel(body, Vector3(ext.x + 0.3 * s, ext.y * 0.4, off), 0.5 * s, 0.06 * s, dark_mat, glow_mat)
+		"pod_array":
+			for sign_v in [-1, 1]:
+				var pod := MeshInstance3D.new()
+				var bm := BoxMesh.new(); bm.size = Vector3(0.22 * s, 0.12 * s, 0.18 * s); bm.material = dark_mat
+				pod.mesh = bm
+				pod.position = Vector3(ext.x * 0.4, -ext.y * 0.4, sign_v * ext.z * 1.2)
+				body.add_child(pod)
+				_add_barrel(body, Vector3(ext.x * 0.4 + 0.3 * s, -ext.y * 0.4, sign_v * ext.z * 1.2), 0.32 * s, 0.045 * s, dark_mat, glow_mat)
+		"missile_rack":
+			for sign_v in [-1, 1]:
+				for i in 3:
+					var off: float = (i - 1) * 0.1 * s
+					var rocket := MeshInstance3D.new()
+					var cm := CylinderMesh.new(); cm.top_radius = 0.05 * s; cm.bottom_radius = 0.05 * s; cm.height = 0.35 * s
+					cm.material = dark_mat
+					rocket.mesh = cm
+					rocket.position = Vector3(ext.x * 0.2, ext.y * 0.4, sign_v * (ext.z + 0.08 * s) + off)
+					rocket.rotation_degrees = Vector3(0, 0, 90)
+					body.add_child(rocket)
+		"turret_array":
+			for sign_v in [-1, 1]:
+				var turret := MeshInstance3D.new()
+				var bm := BoxMesh.new(); bm.size = Vector3(0.3 * s, 0.18 * s, 0.28 * s); bm.material = hull_mat
+				turret.mesh = bm
+				turret.position = Vector3(ext.x * 0.2, ext.y + 0.15 * s, sign_v * ext.z * 0.6)
+				body.add_child(turret)
+				_add_barrel(body, turret.position + Vector3(0.28 * s, 0, 0), 0.4 * s, 0.05 * s, dark_mat, glow_mat)
+		"boss_arms":
+			# 6 long weapon arms
+			for sign_v in [-1, 1]:
+				for arm_off in [0.5 * s, -0.05 * s, -0.55 * s]:
+					var arm := MeshInstance3D.new()
+					var bm := BoxMesh.new(); bm.size = Vector3(0.5 * s, 0.18 * s, 0.35 * s); bm.material = hull_mat
+					arm.mesh = bm
+					arm.position = Vector3(arm_off, 0, sign_v * (ext.z + 0.3 * s))
+					body.add_child(arm)
+					# twin barrel
+					for off2 in [-0.08 * s, 0.08 * s]:
+						_add_barrel(body, Vector3(arm_off + 0.35 * s, 0, sign_v * (ext.z + 0.3 * s) + off2), 0.32 * s, 0.04 * s, dark_mat, glow_mat)
+
+func _add_barrel(body: Node3D, pos: Vector3, length: float, radius: float, dark_mat: StandardMaterial3D, glow_mat: StandardMaterial3D) -> void:
+	var barrel := MeshInstance3D.new()
+	var cm := CylinderMesh.new(); cm.top_radius = radius * 0.85; cm.bottom_radius = radius; cm.height = length
+	cm.material = dark_mat
+	barrel.mesh = cm
+	barrel.position = pos
+	barrel.rotation_degrees = Vector3(0, 0, 90)
+	body.add_child(barrel)
+	# Muzzle tip glow
+	var tip := MeshInstance3D.new()
+	var sm := SphereMesh.new(); sm.radius = radius * 1.1; sm.height = radius * 2.2
+	sm.material = glow_mat
+	tip.mesh = sm
+	tip.position = pos + Vector3(length * 0.55, 0, 0)
+	body.add_child(tip)
+
+func _build_proc_engines(body: Node3D, count: int, ext: Vector3, s: float, dark_mat: StandardMaterial3D, glow_mat: StandardMaterial3D) -> void:
+	if count <= 0:
+		return
+	if count == 1:
+		_add_engine(body, Vector3(-ext.x - 0.15 * s, 0, 0), 0.22 * s, dark_mat, glow_mat)
+	elif count == 2:
+		for sign_v in [-1, 1]:
+			_add_engine(body, Vector3(-ext.x - 0.12 * s, 0, sign_v * ext.z * 0.5), 0.18 * s, dark_mat, glow_mat)
+	elif count == 3:
+		_add_engine(body, Vector3(-ext.x - 0.18 * s, 0, 0), 0.22 * s, dark_mat, glow_mat)
+		for sign_v in [-1, 1]:
+			_add_engine(body, Vector3(-ext.x - 0.1 * s, 0, sign_v * ext.z * 0.7), 0.15 * s, dark_mat, glow_mat)
+	elif count >= 4:
+		for i in count:
+			var ang: float = (i / float(count)) * TAU
+			_add_engine(body, Vector3(-ext.x - 0.08 * s, cos(ang) * ext.y * 0.6, sin(ang) * ext.z * 0.6), 0.13 * s, dark_mat, glow_mat)
+
+func _add_engine(body: Node3D, pos: Vector3, r: float, dark_mat: StandardMaterial3D, glow_mat: StandardMaterial3D) -> void:
+	# Housing ring
+	var ring := MeshInstance3D.new()
+	var cm := CylinderMesh.new(); cm.top_radius = r * 1.1; cm.bottom_radius = r * 0.9; cm.height = r * 1.2
+	cm.material = dark_mat
+	ring.mesh = cm
+	ring.position = pos + Vector3(-r * 0.3, 0, 0)
+	ring.rotation_degrees = Vector3(0, 0, 90)
+	body.add_child(ring)
+	# Glow ball
+	var g := MeshInstance3D.new()
+	var sm := SphereMesh.new(); sm.radius = r; sm.height = r * 2
+	sm.material = glow_mat
+	g.mesh = sm
+	g.position = pos
+	body.add_child(g)
+
+func _build_proc_eyes(body: Node3D, count: int, ext: Vector3, s: float, mat: StandardMaterial3D) -> void:
+	if count == 1:
+		var eye := MeshInstance3D.new()
+		var sm := SphereMesh.new(); sm.radius = 0.13 * s; sm.height = 0.22 * s
+		sm.material = mat
+		eye.mesh = sm
+		eye.position = Vector3(ext.x * 0.85, ext.y * 0.5, 0)
+		body.add_child(eye)
+	else:
+		for i in count:
+			var t: float = (i + 0.5) / count
+			var off: float = (t - 0.5) * ext.z * 1.4
+			var eye := MeshInstance3D.new()
+			var sm := SphereMesh.new(); sm.radius = 0.09 * s; sm.height = 0.18 * s
+			sm.material = mat
+			eye.mesh = sm
+			eye.position = Vector3(ext.x * 0.8, ext.y * 0.4, off)
+			body.add_child(eye)
+
+func _build_proc_dome(body: Node3D, ext: Vector3, s: float, hull_col: Color, eye_col: Color) -> void:
+	var dome_mat := StandardMaterial3D.new()
+	dome_mat.albedo_color = hull_col.darkened(0.6)
+	dome_mat.metallic = 0.95
+	dome_mat.roughness = 0.08
+	dome_mat.emission_enabled = true
+	dome_mat.emission = eye_col
+	dome_mat.emission_energy_multiplier = 2.0
+	var dome := MeshInstance3D.new()
+	var sm := SphereMesh.new(); sm.radius = ext.x * 0.4; sm.height = ext.x * 0.6
+	sm.material = dome_mat
+	dome.mesh = sm
+	dome.position = Vector3(ext.x * 0.1, ext.y + sm.radius * 0.6, 0)
+	body.add_child(dome)
+
+func _build_proc_antenna(body: Node3D, i: int, total: int, ext: Vector3, s: float, dark_mat: StandardMaterial3D, glow_mat: StandardMaterial3D) -> void:
+	var height: float = 0.3 * s + i * 0.05 * s
+	var x_off: float = -ext.x * 0.5 + i * 0.18 * s
+	var stalk := MeshInstance3D.new()
+	var cm := CylinderMesh.new(); cm.top_radius = 0.012 * s; cm.bottom_radius = 0.025 * s; cm.height = height
+	cm.material = dark_mat
+	stalk.mesh = cm
+	stalk.position = Vector3(x_off, ext.y + height * 0.5, 0)
+	body.add_child(stalk)
+	var tip := MeshInstance3D.new()
+	var sm := SphereMesh.new(); sm.radius = 0.04 * s; sm.height = 0.08 * s
+	sm.material = glow_mat
+	tip.mesh = sm
+	tip.position = Vector3(x_off, ext.y + height, 0)
+	body.add_child(tip)
+
+func _build_proc_spikes(body: Node3D, count: int, ext: Vector3, s: float, mat: StandardMaterial3D) -> void:
+	for i in count:
+		var ang: float = (i / float(count)) * TAU
+		var spike := MeshInstance3D.new()
+		var pm := PrismMesh.new(); pm.size = Vector3(0.1 * s, 0.3 * s, 0.08 * s); pm.material = mat
+		spike.mesh = pm
+		spike.position = Vector3(cos(ang) * ext.x * 1.1, 0.05 * s, sin(ang) * ext.z * 1.1)
+		spike.rotation_degrees = Vector3(0, rad_to_deg(ang) + 90, -90)
+		body.add_child(spike)
+
+func _build_proc_armor(body: Node3D, i: int, total: int, ext: Vector3, s: float, hull_col: Color) -> void:
+	var armor_mat := StandardMaterial3D.new()
+	armor_mat.albedo_color = hull_col.lerp(Color(0.3, 0.25, 0.2), 0.4)
+	armor_mat.metallic = 0.4; armor_mat.roughness = 0.7
+	var t: float = (i + 0.5) / total
+	var side: int = -1 if i % 2 == 0 else 1
+	var plate := MeshInstance3D.new()
+	var bm := BoxMesh.new(); bm.size = Vector3(ext.x * 0.6, ext.y * 0.7, 0.1 * s); bm.material = armor_mat
+	plate.mesh = bm
+	plate.position = Vector3((t - 0.5) * ext.x * 0.6, 0, side * (ext.z + 0.06 * s))
+	body.add_child(plate)
+
+func _spawn_p_bullet(pos: Vector3, vel: Vector3) -> void:
+	var b := Entity.new()
+	b.type = "p_bullet"
+	b.pos = pos
+	b.vel = vel
+	b.radius = PROJ_RADIUS
+	b.damage = u_damage
+	b.lifetime = PROJ_LIFETIME * u_range_mult
+	b.pierce = u_pierce
+	b.node = _make_player_laser_mesh(vel)
+	b.node.position = pos
+	world.add_child(b.node)
+	p_bullets.append(b)
+
+func _spawn_muzzle_flash(pos: Vector3, angle: float) -> void:
+	# Bright unshaded sphere + a real OmniLight3D for a one-frame "lit by gunfire"
+	# look on nearby ship parts. Both decay over ~0.08 s in _update_muzzle_flashes.
+	var life: float = 0.09
+	# Visible flash mesh (slightly elongated along firing direction)
+	var flash := MeshInstance3D.new()
+	var sm := SphereMesh.new()
+	sm.radius = 0.32
+	sm.height = 0.64
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(1.0, 0.65, 0.55, 1.0)
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.emission_enabled = true
+	mat.emission = Color(1.0, 0.55, 0.4)
+	mat.emission_energy_multiplier = 9.0
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	sm.material = mat
+	flash.mesh = sm
+	flash.position = pos + Vector3(cos(angle), sin(angle), 0) * 0.2
+	world.add_child(flash)
+	# Short-lived point light so nearby geometry lights up briefly
+	var light := OmniLight3D.new()
+	light.light_color = Color(1.0, 0.7, 0.5)
+	light.light_energy = 4.5
+	light.omni_range = 4.0
+	light.position = pos
+	world.add_child(light)
+	p_muzzle_lights.append({
+		"light": light,
+		"flash": flash,
+		"mat": mat,
+		"life": life,
+		"life_max": life,
+		"energy_max": 4.5,
+		"emit_max": 9.0,
+	})
+
+func _spawn_e_bullet(pos: Vector3, vel: Vector3, dmg: int) -> void:
+	var b := Entity.new()
+	b.type = "e_bullet"
+	b.pos = pos
+	b.vel = vel
+	b.radius = 0.15
+	b.damage = dmg
+	b.lifetime = 3.5
+	b.node = _make_bullet_mesh(false)
+	b.node.position = pos
+	world.add_child(b.node)
+	e_bullets.append(b)
+	if enemy_shot_sfx != null:
+		enemy_shot_sfx.play()
+
+func _make_bullet_mesh(is_player: bool) -> Node3D:
+	var root := Node3D.new()
+	var inst := MeshInstance3D.new()
+	var sm := SphereMesh.new()
+	sm.radius = (PROJ_RADIUS if is_player else 0.12)
+	sm.height = sm.radius * 2.0
+	sm.material = mat_proj if is_player else mat_e_bullet
+	inst.mesh = sm
+	root.add_child(inst)
+	# Glow halo
+	var halo := MeshInstance3D.new()
+	var hm := SphereMesh.new()
+	hm.radius = sm.radius * 2.0
+	hm.height = sm.radius * 4.0
+	var hmat := StandardMaterial3D.new()
+	hmat.albedo_color = Color(1, 1, 1, 0.15)
+	hmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	hmat.emission_enabled = true
+	hmat.emission = (COL_PROJ if is_player else COL_E_BULLET)
+	hmat.emission_energy_multiplier = 1.8
+	hmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	hm.material = hmat
+	halo.mesh = hm
+	root.add_child(halo)
+	# Enemy bullet light — small purple glow that illuminates the ship as it
+	# passes. Player bullets get their light in _make_player_laser_mesh.
+	if not is_player:
+		var l := OmniLight3D.new()
+		l.light_color = COL_E_BULLET
+		l.light_energy = 1.8
+		l.omni_range = 3.5
+		l.omni_attenuation = 1.7
+		root.add_child(l)
+	return root
+
+func _make_player_laser_mesh(vel: Vector3) -> Node3D:
+	# Elongated tracer-style laser bolt. Three layers stacked along the firing
+	# direction: a thin bright core, a wider red halo, and a long faint trail
+	# stretching backward so the projectile reads as a fast-moving streak.
+	var root := Node3D.new()
+
+	var core_mat := StandardMaterial3D.new()
+	core_mat.albedo_color = COL_LASER_CORE
+	core_mat.emission_enabled = true
+	core_mat.emission = COL_LASER_CORE
+	core_mat.emission_energy_multiplier = 7.5
+	core_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+
+	var core := MeshInstance3D.new()
+	var cm := CapsuleMesh.new()
+	cm.radius = 0.09
+	cm.height = 1.4
+	cm.material = core_mat
+	core.mesh = cm
+	root.add_child(core)
+
+	var halo_mat := StandardMaterial3D.new()
+	halo_mat.albedo_color = Color(COL_LASER.r, COL_LASER.g, COL_LASER.b, 0.45)
+	halo_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	halo_mat.emission_enabled = true
+	halo_mat.emission = COL_LASER
+	halo_mat.emission_energy_multiplier = 3.5
+	halo_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	halo_mat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+
+	var halo := MeshInstance3D.new()
+	var hm := CapsuleMesh.new()
+	hm.radius = 0.22
+	hm.height = 1.7
+	hm.material = halo_mat
+	halo.mesh = hm
+	root.add_child(halo)
+
+	# Long faint trail stretching backward — gives the tracer feel.
+	# Sits behind the bullet (negative Y in capsule local space = "backward"
+	# after the root rotation aligns +Y with velocity).
+	var trail_mat := StandardMaterial3D.new()
+	trail_mat.albedo_color = Color(COL_LASER.r, COL_LASER.g, COL_LASER.b, 0.22)
+	trail_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	trail_mat.emission_enabled = true
+	trail_mat.emission = COL_LASER
+	trail_mat.emission_energy_multiplier = 2.2
+	trail_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	trail_mat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+
+	var trail := MeshInstance3D.new()
+	var trm := CapsuleMesh.new()
+	trm.radius = 0.14
+	trm.height = 3.4
+	trm.material = trail_mat
+	trail.mesh = trm
+	# Shift it back so it stretches "behind" the bullet, not symmetrically through it
+	trail.position = Vector3(0, -1.5, 0)
+	root.add_child(trail)
+
+	# Travelling point light — the bolt itself illuminates the ship and any
+	# nearby objects as it flies past. Small range to keep it cheap.
+	var l := OmniLight3D.new()
+	l.light_color = COL_LASER
+	l.light_energy = 2.4
+	l.omni_range = 4.5
+	l.omni_attenuation = 1.8
+	root.add_child(l)
+
+	# CapsuleMesh extends along the Y axis. Rotate around Z so +Y aligns with
+	# the velocity direction in the XY play plane.
+	var ang: float = atan2(vel.y, vel.x) - PI * 0.5
+	root.rotation = Vector3(0, 0, ang)
+	return root
+
+func _spawn_gem(pos: Vector3, value: int) -> void:
+	var g := Entity.new()
+	g.type = "gem"
+	g.pos = pos
+	g.vel = Vector3(randf_range(-2, 2), randf_range(-2, 2), 0)
+	g.radius = 0.35
+	g.value = value
+	g.node = _make_gem_mesh()
+	g.node.position = pos
+	world.add_child(g.node)
+	gems.append(g)
+
+func _make_gem_mesh() -> Node3D:
+	var root := Node3D.new()
+	var inst := MeshInstance3D.new()
+	var pm := PrismMesh.new()
+	pm.size = Vector3(0.45, 0.65, 0.45)
+	pm.material = mat_gem
+	inst.mesh = pm
+	inst.rotation_degrees = Vector3(0, 0, 0)
+	root.add_child(inst)
+	# Mirror prism below
+	var inst2 := MeshInstance3D.new()
+	var pm2 := PrismMesh.new()
+	pm2.size = Vector3(0.45, 0.65, 0.45)
+	pm2.material = mat_gem
+	inst2.mesh = pm2
+	inst2.rotation_degrees = Vector3(0, 0, 180)
+	root.add_child(inst2)
+	# Gem light — small but very visible; piles of gems on the ground will
+	# collectively light the area around them.
+	var l := OmniLight3D.new()
+	l.light_color = COL_XP
+	l.light_energy = 1.4
+	l.omni_range = 3.2
+	l.omni_attenuation = 1.6
+	root.add_child(l)
+	return root
+
+# ============================================================
+# Auto-fire
+# ============================================================
+
+func _update_fire(delta: float) -> void:
+	fire_timer -= delta
+	if fire_timer > 0.0:
+		return
+	fire_timer = P_FIRE_RATE / u_fire_rate_mult
+	# Auto-aim only fires when an enemy is roughly in front of the ship —
+	# the player has to actively turn to bring targets into the cone.
+	var target: Entity = _nearest_enemy_in_cone()
+	if target == null:
+		fire_timer = 0.12
+		return
+	var dir: Vector3 = (target.pos - p_pos).normalized()
+	var n: int = u_projectiles
+	var spread: float = deg_to_rad(u_spread_deg)
+	var base_a: float = atan2(dir.y, dir.x)
+	for i in n:
+		var t: float = 0.5 if n == 1 else float(i) / float(n - 1)
+		var off: float = (t - 0.5) * spread * (1.0 if n > 1 else 0.0)
+		var a: float = base_a + off
+		var muzzle_pos: Vector3 = p_pos + Vector3(cos(a), sin(a), 0) * 0.8
+		var bullet_vel: Vector3 = Vector3(cos(a), sin(a), 0) * PROJ_SPEED
+		_spawn_p_bullet(muzzle_pos, bullet_vel)
+		_spawn_muzzle_flash(muzzle_pos, a)
+	if laser_sfx != null:
+		laser_sfx.play()
+		if u_projectiles > 1 and laser_sfx_echo != null:
+			# 35 ms delayed quieter, slightly-detuned second pew → subtle "double" feel
+			get_tree().create_timer(0.035).timeout.connect(
+				func(): if laser_sfx_echo != null: laser_sfx_echo.play()
+			)
+
+func _nearest_enemy() -> Entity:
+	var best: Entity = null
+	var best_d: float = P_RANGE * u_range_mult
+	for e in enemies:
+		if e.dead:
+			continue
+		var d: float = e.pos.distance_to(p_pos)
+		if d < best_d:
+			best_d = d
+			best = e
+	return best
+
+func _nearest_enemy_in_cone() -> Entity:
+	# Like _nearest_enemy, but only considers enemies whose direction from the
+	# player lies within FIRE_CONE_DEG of p_facing. Drives the new "ship must
+	# point roughly at target before it fires" mechanic.
+	var best: Entity = null
+	var best_d: float = P_RANGE * u_range_mult
+	var cone_cos: float = cos(deg_to_rad(FIRE_CONE_DEG))
+	for e in enemies:
+		if e.dead:
+			continue
+		var to_e: Vector3 = e.pos - p_pos
+		var d: float = to_e.length()
+		if d > best_d or d < 0.001:
+			continue
+		if to_e.normalized().dot(p_facing) < cone_cos:
+			continue
+		best_d = d
+		best = e
+	return best
+
+# ============================================================
+# Collisions
+# ============================================================
+
+func _resolve_collisions() -> void:
+	for b in p_bullets:
+		if b.dead:
+			continue
+		for e in enemies:
+			if e.dead:
+				continue
+			if b.pos.distance_to(e.pos) <= b.radius + e.radius:
+				e.hp -= b.damage
+				e.hit_flash = 1.0
+				if b.pierce > 0:
+					b.pierce -= 1
+				else:
+					b.dead = true
+				if e.hp <= 0:
+					_kill_enemy(e)
+				if b.dead:
+					break
+
+	if p_invuln_timer <= 0.0:
+		for b in e_bullets:
+			if b.dead:
+				continue
+			if b.pos.distance_to(p_pos) <= P_RADIUS + b.radius:
+				_player_take_damage(b.damage)
+				b.dead = true
+				if p_invuln_timer > 0.0:
+					break
+
+	if p_invuln_timer <= 0.0:
+		for e in enemies:
+			if e.dead:
+				continue
+			if e.pos.distance_to(p_pos) <= P_RADIUS + e.radius:
+				_player_take_damage(e.damage)
+				var push: Vector3 = (e.pos - p_pos).normalized() * 1.6
+				e.pos += push
+				break
+
+func _kill_enemy(e: Entity) -> void:
+	e.dead = true
+	kills += 1
+	var gem_count: int = 1
+	if e.type == "shooter":
+		gem_count = 2
+	elif e.type == "tank":
+		gem_count = 4
+	elif e.type == "boss":
+		gem_count = 12
+	for i in gem_count:
+		_spawn_gem(e.pos + Vector3(randf_range(-0.4, 0.4), randf_range(-0.4, 0.4), 0), e.value)
+	_camera_shake(0.6 if e.type == "boss" else 0.18, 0.25 if e.type == "boss" else 0.1)
+
+func _player_take_damage(dmg: int) -> void:
+	p_hp -= dmg
+	p_invuln_timer = P_INVULN
+	_camera_shake(0.45, 0.2)
+	if damage_sfx != null:
+		damage_sfx.play()
+
+func _check_lightning_strikes(delta: float) -> void:
+	# When inside a storm nebula, periodic lightning strikes can hit the player.
+	# Uses ellipsoid containment via the nebula's local transform (handles its
+	# rotation and non-uniform scale automatically).
+	for sn in storm_nebulae:
+		sn["strike_timer"] -= delta
+		if sn["strike_timer"] > 0.0:
+			continue
+		sn["strike_timer"] = randf_range(sn["interval_min"], sn["interval_max"])
+		var node: Node3D = sn["node"]
+		if not is_instance_valid(node):
+			continue
+		var local: Vector3 = node.to_local(Vector3(p_pos.x, p_pos.y, 0.0))
+		if local.length() < sn["radius"]:
+			# Visible bolt always plays — even during i-frames — so the player
+			# sees the strike that's been counted.
+			_spawn_lightning_bolt(Vector3(p_pos.x, p_pos.y, 0.0))
+			if p_invuln_timer <= 0.0:
+				_player_take_damage(int(sn["damage"]))
+				_camera_shake(0.55, 0.18)
+	_update_lightning_bolts(delta)
+
+func _spawn_lightning_bolt(target_pos: Vector3) -> void:
+	# Build a jagged emissive bolt from above the play plane down through the
+	# target. Made of short box segments with random XY jitter between them so
+	# the path looks fractal. A second pass with thicker, dimmer boxes forms a
+	# glow halo around the bright core.
+	if lightning_strike_sfx != null:
+		lightning_strike_sfx.pitch_scale = randf_range(0.92, 1.08)
+		lightning_strike_sfx.play()
+	var root := Node3D.new()
+	world.add_child(root)
+
+	var start: Vector3 = target_pos + Vector3(randf_range(-2.5, 2.5), randf_range(-2.5, 2.5), 32.0)
+	var end: Vector3 = target_pos + Vector3(0, 0, -5.0)
+	var n_segs: int = randi_range(10, 14)
+
+	# Build a jittered path from start to end
+	var path: Array[Vector3] = [start]
+	for i in range(1, n_segs):
+		var t: float = float(i) / float(n_segs)
+		var base: Vector3 = start.lerp(end, t)
+		# Wider jitter in middle, tightening as it approaches target
+		var jitter_scale: float = (1.0 - abs(t - 0.5) * 1.8) * 1.4
+		var jitter: Vector3 = Vector3(randf_range(-1.0, 1.0), randf_range(-1.0, 1.0), randf_range(-0.4, 0.4)) * jitter_scale
+		path.append(base + jitter)
+	path.append(end)
+
+	# Core (thin, very bright) and halo (thicker, dimmer) materials
+	var core_mat := StandardMaterial3D.new()
+	core_mat.albedo_color = Color(1.0, 1.0, 1.0)
+	core_mat.emission_enabled = true
+	core_mat.emission = Color(0.85, 0.92, 1.0)
+	core_mat.emission_energy_multiplier = 12.0
+	core_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+
+	var halo_mat := StandardMaterial3D.new()
+	halo_mat.albedo_color = Color(0.6, 0.75, 1.0, 0.4)
+	halo_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	halo_mat.emission_enabled = true
+	halo_mat.emission = Color(0.5, 0.7, 1.0)
+	halo_mat.emission_energy_multiplier = 5.0
+	halo_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+
+	for i in range(path.size() - 1):
+		_add_bolt_segment(root, path[i], path[i + 1], 0.12, core_mat)
+		_add_bolt_segment(root, path[i], path[i + 1], 0.45, halo_mat)
+
+	# Optional side branches off the main bolt
+	var branch_count: int = randi_range(0, 2)
+	for b in branch_count:
+		var idx: int = randi_range(2, path.size() - 3)
+		var branch_start: Vector3 = path[idx]
+		var branch_dir: Vector3 = Vector3(randf_range(-1, 1), randf_range(-1, 1), -randf_range(0.2, 0.7)).normalized()
+		var branch_len: float = randf_range(2.5, 5.5)
+		var branch_end: Vector3 = branch_start + branch_dir * branch_len
+		var sub_segs: int = 4
+		var prev: Vector3 = branch_start
+		for s in range(1, sub_segs + 1):
+			var t: float = float(s) / float(sub_segs)
+			var bp: Vector3 = branch_start.lerp(branch_end, t) + Vector3(randf_range(-0.4, 0.4), randf_range(-0.4, 0.4), 0)
+			_add_bolt_segment(root, prev, bp, 0.08, core_mat)
+			_add_bolt_segment(root, prev, bp, 0.3, halo_mat)
+			prev = bp
+
+	active_bolts.append({
+		"root": root,
+		"age": 0.0,
+		"lifetime": randf_range(0.18, 0.28),
+	})
+
+func _add_bolt_segment(parent: Node3D, a: Vector3, b: Vector3, thickness: float, mat: Material) -> void:
+	var len_v: float = (b - a).length()
+	if len_v < 0.001:
+		return
+	var box := MeshInstance3D.new()
+	var bm := BoxMesh.new()
+	bm.size = Vector3(thickness, thickness, len_v)
+	bm.material = mat
+	box.mesh = bm
+	parent.add_child(box)
+	box.position = (a + b) * 0.5
+	var dir: Vector3 = (b - a).normalized()
+	var up: Vector3 = Vector3.UP if abs(dir.dot(Vector3.UP)) < 0.95 else Vector3.RIGHT
+	# look_at points -Z at the target; aiming at `a` makes +Z point toward `b`
+	# which matches the box's length axis.
+	box.look_at(a, up)
+
+func _update_lightning_bolts(delta: float) -> void:
+	# Bolts pop bright then disappear — no fade animation, just lifetime cull.
+	var i: int = active_bolts.size() - 1
+	while i >= 0:
+		var bolt = active_bolts[i]
+		bolt["age"] += delta
+		if bolt["age"] >= bolt["lifetime"]:
+			if is_instance_valid(bolt["root"]):
+				bolt["root"].queue_free()
+			active_bolts.remove_at(i)
+		i -= 1
+
+# ============================================================
+# Wave / level up
+# ============================================================
+
+func _update_wave(delta: float) -> void:
+	wave_timer -= delta
+	if wave_timer <= 0.0:
+		_next_wave()
+
+func _next_wave() -> void:
+	wave += 1
+	wave_timer = WAVE_DURATION
+	spawn_interval = max(0.35, 1.5 - wave * 0.08)
+	if wave % BOSS_EVERY == 0:
+		_spawn_boss_wave()
+
+func _xp_for_next() -> int:
+	return XP_BASE + (p_level - 1) * XP_INC + int(pow(p_level - 1, 1.5))
+
+func _check_level_up() -> void:
+	while p_xp >= _xp_for_next():
+		p_xp -= _xp_for_next()
+		p_level += 1
+		_offer_levelup()
+		return
+
+func _offer_levelup() -> void:
+	state = STATE_LEVELUP
+	var pool := _upgrade_pool()
+	pool.shuffle()
+	var picks: Array = []
+	while picks.size() < 3 and pool.size() > 0:
+		picks.append(pool.pop_front())
+	for i in levelup_buttons.size():
+		var btn: Button = levelup_buttons[i]
+		if i < picks.size():
+			btn.visible = true
+			btn.text = picks[i]["label"]
+			btn.set_meta("upgrade", picks[i])
+		else:
+			btn.visible = false
+	levelup_panel.visible = true
+
+func _upgrade_pool() -> Array:
+	return [
+		{"id":"proj","label":"+1 Schuss pro Salve","apply":Callable(self, "_up_proj")},
+		{"id":"rate","label":"+25% Feuerrate","apply":Callable(self, "_up_rate")},
+		{"id":"dmg", "label":"+30% Schaden","apply":Callable(self, "_up_dmg")},
+		{"id":"speed","label":"+15% Geschwindigkeit","apply":Callable(self, "_up_speed")},
+		{"id":"range","label":"+25% Reichweite","apply":Callable(self, "_up_range")},
+		{"id":"pickup","label":"+40% Pickup-Radius","apply":Callable(self, "_up_pickup")},
+		{"id":"hp",  "label":"+25 Max HP","apply":Callable(self, "_up_maxhp")},
+		{"id":"heal","label":"Heilung: voll auffüllen","apply":Callable(self, "_up_heal")},
+		{"id":"pierce","label":"+1 Durchschlag","apply":Callable(self, "_up_pierce")},
+		{"id":"boost_tank","label":"+40% Boost-Tank","apply":Callable(self, "_up_boost_tank")},
+		{"id":"boost_str","label":"+15% Boost-Stärke","apply":Callable(self, "_up_boost_strength")},
+	]
+
+func _up_proj():   u_projectiles += 1;       _visual_add_gun()
+func _up_rate():   u_fire_rate_mult *= 1.25; _visual_add_engine()
+func _up_dmg():    u_damage = int(round(u_damage * 1.30)); _visual_grow_damage_core()
+func _up_speed():  u_speed_mult *= 1.15;     _visual_add_speed_fin()
+func _up_range():
+	u_range_mult *= 1.25
+	_visual_add_sensor()
+	_apply_range_zoom()
+
+func _apply_range_zoom() -> void:
+	# Range upgrades zoom the camera out and scale the ship up by the same
+	# factor — net effect: ship stays the same size on screen, but more world
+	# becomes visible (matching the now-longer shooting range).
+	cam_base_pos = CAM_OFFSET_BASE * u_range_mult
+	if p_node != null:
+		p_node.scale = Vector3.ONE * SHIP_SCALE_BASE * u_range_mult
+func _up_pickup(): u_pickup_mult *= 1.40;    _visual_set_pickup_ring()
+func _up_maxhp():  p_max_hp += 25; p_hp += 25; _visual_add_armor()
+func _up_heal():   p_hp = p_max_hp
+func _up_pierce(): u_pierce += 1;            _visual_set_pierce_lance()
+func _up_boost_tank():
+	u_boost_max *= 1.40
+	boost_charge = u_boost_max  # refund full on capacity upgrade
+func _up_boost_strength():
+	u_boost_strength += 0.25
+
+# ============================================================
+# Visual upgrade attachments
+# ============================================================
+
+func _mat_metal(albedo: Color, emit_e: float = 0.3) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = albedo
+	m.emission_enabled = true
+	m.emission = albedo
+	m.emission_energy_multiplier = emit_e
+	m.metallic = 0.7
+	m.roughness = 0.3
+	return m
+
+func _visual_add_gun() -> void:
+	# Side-mounted gun barrel — custom (Kenney models had orientation issues)
+	var n: int = visual_guns.size()
+	var side: int = -1 if (n % 2 == 0) else 1
+	var stack: int = (n / 2) + 1
+	var gun_root := Node3D.new()
+	# Barrel (cylinder)
+	var gun := MeshInstance3D.new()
+	var cm := CylinderMesh.new()
+	cm.top_radius = 0.07
+	cm.bottom_radius = 0.09
+	cm.height = 0.6
+	cm.material = _mat_metal(Color(0.45, 0.5, 0.6))
+	gun.mesh = cm
+	gun.position = Vector3(0.45, 0.0, 0)
+	gun.rotation_degrees = Vector3(0, 0, 90)
+	gun_root.add_child(gun)
+	# Muzzle glow
+	var muzzle := MeshInstance3D.new()
+	var mm := SphereMesh.new()
+	mm.radius = 0.08; mm.height = 0.16
+	var mmat := StandardMaterial3D.new()
+	mmat.albedo_color = Color(0.5, 1.0, 0.95)
+	mmat.emission_enabled = true
+	mmat.emission = Color(0.5, 1.0, 0.95)
+	mmat.emission_energy_multiplier = 4.0
+	mmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mm.material = mmat
+	muzzle.mesh = mm
+	muzzle.position = Vector3(0.78, 0.0, 0)
+	gun_root.add_child(muzzle)
+	# Mount base
+	var mount := MeshInstance3D.new()
+	var bm := BoxMesh.new()
+	bm.size = Vector3(0.18, 0.1, 0.2); bm.material = _mat_metal(Color(0.3, 0.34, 0.4))
+	mount.mesh = bm
+	mount.position = Vector3(0.18, -0.05, 0)
+	gun_root.add_child(mount)
+	# Position on wing
+	gun_root.position = Vector3(0.0, 0.05, side * (0.3 + stack * 0.18))
+	ship_render.add_child(gun_root)
+	visual_guns.append(gun_root)
+
+func _visual_add_engine() -> void:
+	# Extra side thruster — adds power and visual
+	var n: int = visual_engines.size()
+	var side: int = -1 if (n % 2 == 0) else 1
+	var stack: int = (n / 2) + 1
+	var pod := MeshInstance3D.new()
+	var cm := CylinderMesh.new()
+	cm.top_radius = 0.1
+	cm.bottom_radius = 0.12
+	cm.height = 0.4
+	cm.material = _mat_metal(Color(0.4, 0.45, 0.55))
+	pod.mesh = cm
+	pod.position = Vector3(-0.5, -0.02, side * (0.4 + stack * 0.18))
+	pod.rotation_degrees = Vector3(0, 0, 90)
+	ship_render.add_child(pod)
+	# Thruster glow
+	var glow := MeshInstance3D.new()
+	var sm := SphereMesh.new()
+	sm.radius = 0.13; sm.height = 0.26
+	var gmat := StandardMaterial3D.new()
+	gmat.albedo_color = Color(0.5, 0.9, 1.0)
+	gmat.emission_enabled = true
+	gmat.emission = Color(0.5, 0.9, 1.0)
+	gmat.emission_energy_multiplier = 3.5
+	gmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	sm.material = gmat
+	glow.mesh = sm
+	glow.position = Vector3(-0.78, -0.02, side * (0.4 + stack * 0.18))
+	ship_render.add_child(glow)
+	visual_engines.append(pod)
+
+func _visual_grow_damage_core() -> void:
+	# Damage upgrade: glowing energy core under cockpit grows brighter/larger
+	visual_damage_lvl += 1
+	if visual_damage_core != null:
+		visual_damage_core.queue_free()
+	var core := MeshInstance3D.new()
+	var sm := SphereMesh.new()
+	var r: float = 0.13 + visual_damage_lvl * 0.04
+	sm.radius = r; sm.height = r * 2
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(1.0, 0.55, 0.85)
+	mat.emission_enabled = true
+	mat.emission = Color(1.0, 0.4, 0.8)
+	mat.emission_energy_multiplier = 2.0 + visual_damage_lvl * 0.6
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	sm.material = mat
+	core.mesh = sm
+	core.position = Vector3(0.05, 0.06, 0)
+	ship_render.add_child(core)
+	visual_damage_core = core
+
+func _visual_add_speed_fin() -> void:
+	# Custom tail fin / aero fin — extra speed look
+	var n: int = visual_speed_fins.size()
+	var side: int = -1 if (n % 2 == 0) else 1
+	var fin := MeshInstance3D.new()
+	var pm := PrismMesh.new()
+	pm.size = Vector3(0.3, 0.32, 0.06); pm.material = _mat_metal(Color(0.5, 0.6, 0.75))
+	fin.mesh = pm
+	fin.position = Vector3(-0.35, 0.22, side * 0.22)
+	fin.rotation_degrees = Vector3(0, 0, 12 * side)
+	ship_render.add_child(fin)
+	visual_speed_fins.append(fin)
+
+func _visual_add_sensor() -> void:
+	# Custom antenna/dish on top of ship
+	var n: int = visual_sensors.size()
+	var stalk := MeshInstance3D.new()
+	var cyl := CylinderMesh.new()
+	cyl.top_radius = 0.015; cyl.bottom_radius = 0.022
+	cyl.height = 0.28 + n * 0.06
+	cyl.material = _mat_metal(Color(0.6, 0.65, 0.7))
+	stalk.mesh = cyl
+	stalk.position = Vector3(0.05 - n * 0.18, 0.32 + (cyl.height * 0.5), 0)
+	ship_render.add_child(stalk)
+	var dish := MeshInstance3D.new()
+	var sm := SphereMesh.new()
+	sm.radius = 0.08; sm.height = 0.1
+	var dmat := StandardMaterial3D.new()
+	dmat.albedo_color = Color(0.6, 1.0, 0.7)
+	dmat.emission_enabled = true
+	dmat.emission = Color(0.5, 1.0, 0.7)
+	dmat.emission_energy_multiplier = 2.5
+	dmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	sm.material = dmat
+	dish.mesh = sm
+	dish.position = Vector3(0.05 - n * 0.18, 0.36 + cyl.height, 0)
+	ship_render.add_child(dish)
+	visual_sensors.append(stalk)
+
+func _visual_set_pickup_ring() -> void:
+	# Magnetic pickup ring around ship — single torus, not noisy dots
+	if visual_pickup_ring != null:
+		visual_pickup_ring.queue_free()
+	visual_pickup_ring = MeshInstance3D.new()
+	var tm := TorusMesh.new()
+	tm.inner_radius = 0.92
+	tm.outer_radius = 0.98
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.95, 0.7, 1.0)
+	mat.emission_enabled = true
+	mat.emission = Color(0.85, 0.55, 1.0)
+	mat.emission_energy_multiplier = 1.8
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.albedo_color.a = 0.7
+	tm.material = mat
+	visual_pickup_ring.mesh = tm
+	# Torus default lies in XZ plane (open along Y) — perfect for our ring around ship
+	ship_render.add_child(visual_pickup_ring)
+
+func _visual_add_armor() -> void:
+	# Custom armor plate strapped to hull
+	var n: int = visual_armor.size()
+	var side: int = -1 if (n % 2 == 0) else 1
+	var stack: int = (n / 2)
+	var plate := MeshInstance3D.new()
+	var bm := BoxMesh.new()
+	bm.size = Vector3(0.5, 0.12, 0.18)
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.55, 0.4, 0.3)
+	mat.emission_enabled = true
+	mat.emission = Color(0.3, 0.2, 0.15)
+	mat.emission_energy_multiplier = 0.25
+	mat.metallic = 0.5
+	mat.roughness = 0.6
+	bm.material = mat
+	plate.mesh = bm
+	plate.position = Vector3(-0.15 + stack * 0.3, 0.05, side * 0.5)
+	ship_render.add_child(plate)
+	visual_armor.append(plate)
+
+func _visual_set_pierce_lance() -> void:
+	# Custom tapered cylinder forming a spike — pierce upgrade
+	if visual_pierce != null:
+		visual_pierce.queue_free()
+	visual_pierce = Node3D.new()
+	var spike := MeshInstance3D.new()
+	var cm := CylinderMesh.new()
+	cm.top_radius = 0.0
+	cm.bottom_radius = 0.08
+	cm.height = 0.45 + u_pierce * 0.18
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(1.0, 0.6, 0.4)
+	mat.emission_enabled = true
+	mat.emission = Color(1.0, 0.5, 0.3)
+	mat.emission_energy_multiplier = 2.5
+	mat.metallic = 0.8
+	mat.roughness = 0.2
+	cm.material = mat
+	spike.mesh = cm
+	# Cylinder default vertical (+Y up). Rotate Z=-90° to lay it forward (+X tip).
+	spike.position = Vector3(1.15 + u_pierce * 0.06 + (cm.height * 0.5), 0, 0)
+	spike.rotation_degrees = Vector3(0, 0, -90)
+	visual_pierce.add_child(spike)
+	ship_render.add_child(visual_pierce)
+
+func _on_levelup_pick(idx: int) -> void:
+	if idx >= levelup_buttons.size():
+		return
+	var btn: Button = levelup_buttons[idx]
+	if not btn.visible:
+		return
+	var up: Dictionary = btn.get_meta("upgrade")
+	up["apply"].call()
+	levelup_panel.visible = false
+	state = STATE_PLAYING
+
+# ============================================================
+# State / restart / shake
+# ============================================================
+
+func _check_state() -> void:
+	if p_hp <= 0:
+		state = STATE_GAMEOVER
+		go_panel.visible = true
+		go_title.text = "GAME OVER"
+		go_title.add_theme_color_override("font_color", Color(1.0, 0.45, 0.4))
+		go_detail.text = "Welle %d  ·  %d Kills  ·  %d Sekunden überlebt\n\n[ Leertaste / Klick = Neuer Run ]" % [wave, kills, int(run_time)]
+
+func _restart_run() -> void:
+	for e in enemies:
+		if e.node != null:
+			e.node.queue_free()
+	for b in p_bullets:
+		if b.node != null:
+			b.node.queue_free()
+	for b in e_bullets:
+		if b.node != null:
+			b.node.queue_free()
+	for g in gems:
+		if g.node != null:
+			g.node.queue_free()
+	enemies.clear()
+	p_bullets.clear()
+	e_bullets.clear()
+	gems.clear()
+	# Rebuild player ship (clears all visual upgrades)
+	if p_node != null:
+		p_node.queue_free()
+	visual_guns.clear()
+	visual_engines.clear()
+	visual_armor.clear()
+	visual_sensors.clear()
+	visual_speed_fins.clear()
+	visual_pierce = null
+	visual_pickup_ring = null
+	visual_damage_core = null
+	visual_damage_lvl = 0
+	_build_player()
+	p_pos = Vector3.ZERO
+	p_vel = Vector3.ZERO
+	p_hp = P_HP
+	p_max_hp = P_HP
+	p_level = 1
+	p_xp = 0
+	wave = 1
+	wave_timer = WAVE_DURATION
+	spawn_timer = 1.5
+	spawn_interval = 1.5
+	fire_timer = 0.0
+	p_invuln_timer = 0.0
+	u_speed_mult = 1.0
+	u_fire_rate_mult = 1.0
+	u_damage = 12
+	u_projectiles = 1
+	u_range_mult = 1.0
+	_apply_range_zoom()
+	u_pickup_mult = 1.0
+	u_pierce = 0
+	u_boost_max = 1.0
+	u_boost_strength = 1.8
+	boost_charge = 1.0
+	boosting = false
+	boost_depleted = false
+	kills = 0
+	run_time = 0.0
+	state = STATE_PLAYING
+	go_panel.visible = false
+	levelup_panel.visible = false
+
+func _purge_dead() -> void:
+	var keep_e: Array = []
+	for e in enemies:
+		if e.dead:
+			if e.node != null:
+				e.node.queue_free()
+		else:
+			keep_e.append(e)
+	enemies = keep_e
+	var keep_pb: Array = []
+	for b in p_bullets:
+		if b.dead:
+			if b.node != null:
+				b.node.queue_free()
+		else:
+			keep_pb.append(b)
+	p_bullets = keep_pb
+	var keep_eb: Array = []
+	for b in e_bullets:
+		if b.dead:
+			if b.node != null:
+				b.node.queue_free()
+		else:
+			keep_eb.append(b)
+	e_bullets = keep_eb
+	var keep_g: Array = []
+	for g in gems:
+		if g.dead:
+			if g.node != null:
+				g.node.queue_free()
+		else:
+			keep_g.append(g)
+	gems = keep_g
+
+func _camera_shake(amount: float, dur: float) -> void:
+	shake_amount = max(shake_amount, amount)
+	shake_timer = max(shake_timer, dur)
+
+func _update_shake(delta: float) -> void:
+	# Follow camera: smoothly trail the player while keeping the side angle
+	var follow_target: Vector3 = p_pos + cam_base_pos
+	var shake_off: Vector3 = Vector3.ZERO
+	if shake_timer > 0.0:
+		shake_timer -= delta
+		var s: float = shake_amount * (shake_timer / max(0.001, shake_timer + delta))
+		shake_off = Vector3(randf_range(-1, 1), randf_range(-1, 1), 0) * s * 0.45
+		if shake_timer <= 0.0:
+			shake_amount = 0.0
+	cam.position = cam.position.lerp(follow_target, clamp(delta * 5.5, 0.0, 1.0)) + shake_off
+	cam.look_at(p_pos, Vector3.UP)
+	# Smoothly ease FOV toward target (boost widens it; default snaps back)
+	if cam != null:
+		cam.fov = lerp(cam.fov, p_cam_fov_target, clamp(delta * 6.0, 0.0, 1.0))
+
+func _animate_ship_lights(delta: float) -> void:
+	# Sine-pulse the emission of every registered status light so the ship feels
+	# alive. Each entry has its own freq/phase so they don't pulse in unison.
+	var t: float = run_time
+	for L in p_pulse_lights:
+		var mat: StandardMaterial3D = L["mat"]
+		if mat == null:
+			continue
+		var v: float = sin(t * L["freq"] * TAU + L["phase"])
+		mat.emission_energy_multiplier = max(0.05, L["base"] + L["amp"] * v)
+	# Engine glow: BOTH engines updated with two EXPLICIT assignments (no loop,
+	# no array iteration). Whatever was making the left engine fail to pulse,
+	# this guarantees the assignment happens for both.
+	var speed_norm: float = clamp(p_vel.length() / P_SPEED, 0.0, 1.5)
+	var boost_kick: float = (u_boost_strength - 1.0) if boosting else 0.0
+	var target_e: float = 3.0 + speed_norm * 3.0 + boost_kick * 3.5
+	var jitter: float = 0.25 * sin(t * 28.0)
+	var engine_val: float = max(1.0, target_e + jitter)
+	if p_engine_mat_port != null:
+		p_engine_mat_port.emission_energy_multiplier = engine_val
+	if p_engine_mat_starboard != null:
+		p_engine_mat_starboard.emission_energy_multiplier = engine_val
+	# Boost flame: visible only while boosting, length scales with charge level.
+	if p_boost_flame != null and p_boost_flame_mat != null:
+		var want_visible: bool = boosting and boost_charge > 0.01
+		p_boost_flame.visible = want_visible
+		var target_len: float = 0.0
+		var target_rad: float = 0.0
+		if want_visible:
+			# Length pulses 0.85x..1.15x for a "breathing" jet
+			var pulse: float = 1.0 + 0.15 * sin(t * 22.0)
+			target_len = 3.8 * pulse * (0.7 + 0.3 * (boost_charge / max(0.001, u_boost_max)))
+			target_rad = 1.2 + 0.15 * sin(t * 18.0)
+		# Scale.x is along ship-forward (engine direction) after the Z-rotation;
+		# scale.y is the radius. Smooth so it doesn't pop.
+		var cur: Vector3 = p_boost_flame.scale
+		var tgt: Vector3 = Vector3(target_len if want_visible else 0.01,
+			target_rad if want_visible else 0.01,
+			target_rad if want_visible else 0.01)
+		# Quick ramp-up, slow fade-out
+		var lerp_t: float = clamp(delta * (14.0 if want_visible else 8.0), 0.0, 1.0)
+		p_boost_flame.scale = cur.lerp(tgt, lerp_t)
+		p_boost_flame_mat.emission_energy_multiplier = (7.5 if want_visible else 0.5)
+	# Camera FOV target: snap upward while boosting, ease back when not.
+	if boosting:
+		p_cam_fov_target = p_cam_fov_base + 10.0
+	else:
+		p_cam_fov_target = p_cam_fov_base
+
+func _build_speedlines() -> void:
+	# Radial streak overlay used during boost. Each streak is a ColorRect with
+	# its own outward direction; alpha is gated globally by speedlines_alpha.
+	speedlines_layer = CanvasLayer.new()
+	speedlines_layer.layer = 9  # in front of game world, behind HUD (HUD is layer 10+ usually)
+	add_child(speedlines_layer)
+	var n: int = 26
+	for i in n:
+		var rect := ColorRect.new()
+		rect.color = Color(0.85, 0.95, 1.0, 0.0)
+		rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		rect.size = Vector2(randf_range(40, 90), 2.0)
+		rect.pivot_offset = rect.size * 0.5
+		speedlines_layer.add_child(rect)
+		# Initial direction radiates from screen center
+		var ang: float = randf() * TAU
+		var dir := Vector2(cos(ang), sin(ang))
+		var radius: float = randf_range(80, 260)
+		var center := Vector2(640, 360)
+		var pos: Vector2 = center + dir * radius
+		rect.position = pos - rect.size * 0.5
+		rect.rotation = ang
+		speedlines.append({
+			"rect": rect,
+			"dir": dir,
+			"speed": randf_range(900.0, 1500.0),
+			"center": center,
+		})
+
+func _animate_speedlines(delta: float) -> void:
+	# Target alpha: full during boost, zero otherwise. Smoothly ramp.
+	var want: float = 1.0 if (boosting and boost_charge > 0.02) else 0.0
+	speedlines_alpha = lerp(speedlines_alpha, want, clamp(delta * (10.0 if want > 0 else 5.0), 0.0, 1.0))
+	if speedlines_alpha < 0.005:
+		# Hide all streaks while idle to skip per-rect work
+		for s in speedlines:
+			var rect: ColorRect = s["rect"]
+			rect.color.a = 0.0
+		return
+	for s in speedlines:
+		var rect: ColorRect = s["rect"]
+		var dir: Vector2 = s["dir"]
+		# Push outward, alpha falls off near screen edges → respawn near center
+		var center: Vector2 = s["center"]
+		var pos: Vector2 = rect.position + rect.size * 0.5
+		pos += dir * s["speed"] * delta
+		var off: Vector2 = pos - center
+		var dist: float = off.length()
+		if dist > 720.0:
+			# Respawn near center with new direction
+			var ang2: float = randf() * TAU
+			s["dir"] = Vector2(cos(ang2), sin(ang2))
+			var r2: float = randf_range(60, 180)
+			pos = center + s["dir"] * r2
+			rect.rotation = ang2
+		rect.position = pos - rect.size * 0.5
+		# Alpha curve: fade in within first ~150px, hold, fade out past ~600px
+		var a: float = 1.0
+		if dist < 150.0:
+			a = dist / 150.0
+		elif dist > 500.0:
+			a = max(0.0, 1.0 - (dist - 500.0) / 220.0)
+		rect.color.a = a * speedlines_alpha * 0.55
+
+func _update_muzzle_flashes(delta: float) -> void:
+	# Tick down each active muzzle flash, fade emission + light energy with life.
+	var keep: Array = []
+	for entry in p_muzzle_lights:
+		entry["life"] -= delta
+		if entry["life"] <= 0.0:
+			if entry["light"] != null and is_instance_valid(entry["light"]):
+				entry["light"].queue_free()
+			if entry["flash"] != null and is_instance_valid(entry["flash"]):
+				entry["flash"].queue_free()
+			continue
+		var frac: float = entry["life"] / entry["life_max"]
+		if entry["light"] != null and is_instance_valid(entry["light"]):
+			entry["light"].light_energy = entry["energy_max"] * frac
+		if entry["mat"] != null:
+			entry["mat"].emission_energy_multiplier = entry["emit_max"] * frac
+			var c: Color = entry["mat"].albedo_color
+			c.a = frac
+			entry["mat"].albedo_color = c
+		if entry["flash"] != null and is_instance_valid(entry["flash"]):
+			entry["flash"].scale = Vector3.ONE * (0.6 + frac * 0.8)
+		keep.append(entry)
+	p_muzzle_lights = keep
+
+func _animate_background(delta: float) -> void:
+	# Wrap stars around the player so the field is endless
+	var wrap_max: float = 70.0
+	var wrap_min: float = 45.0
+	for s in stars:
+		var diff: Vector3 = s.position - p_pos
+		if diff.length() > wrap_max:
+			var new_dir: Vector3 = -diff.normalized() + Vector3(randf_range(-0.4, 0.4), randf_range(-0.4, 0.4), randf_range(-0.3, 0.3))
+			new_dir = new_dir.normalized()
+			s.position = p_pos + new_dir * randf_range(wrap_min, wrap_max - 5.0)
+	# Wrap + rotate distant objects (planets, nebulae, asteroid clusters)
+	for obj_data in distant_objects:
+		var node: Node3D = obj_data["node"]
+		var wr: float = obj_data["wrap_radius"]
+		# Slow rotation for visual life
+		var axis: Vector3 = obj_data["rot_axis"]
+		var rs: float = obj_data["rot_speed"]
+		node.rotate(axis, rs * delta)
+		# Wrap if too far in XY (ignore Z so it stays distant)
+		var dx: float = node.position.x - p_pos.x
+		var dy: float = node.position.y - p_pos.y
+		var planar: float = sqrt(dx * dx + dy * dy)
+		if planar > wr:
+			# Move to opposite side at near-distance
+			var inv: Vector3 = -Vector3(dx, dy, 0).normalized()
+			var inv_off: Vector3 = inv + Vector3(randf_range(-0.4, 0.4), randf_range(-0.4, 0.4), 0)
+			inv_off = inv_off.normalized()
+			var new_planar: float = randf_range(wr * 0.5, wr * 0.85)
+			node.position = Vector3(p_pos.x + inv_off.x * new_planar, p_pos.y + inv_off.y * new_planar, node.position.z)
+
+# ============================================================
+# HUD
+# ============================================================
+
+func _build_hud() -> void:
+	hud = CanvasLayer.new()
+	add_child(hud)
+
+	lbl_hp = _hud_label("", Vector2(18, 14), 14, COL_TEXT)
+	_hud_rect(Vector2(18, 36), Vector2(260, 12), Color(0.12, 0.06, 0.08))
+	bar_hp_fill = _hud_rect(Vector2(18, 36), Vector2(260, 12), Color(0.55, 0.95, 0.55))
+
+	lbl_xp = _hud_label("", Vector2(18, 58), 12, COL_DIM)
+	_hud_rect(Vector2(18, 78), Vector2(260, 8), Color(0.08, 0.08, 0.14))
+	bar_xp_fill = _hud_rect(Vector2(18, 78), Vector2(260, 8), Color(0.45, 0.85, 1.0))
+
+	lbl_boost = _hud_label("BOOST  [Shift]", Vector2(18, 92), 11, Color(1.0, 0.75, 0.35))
+	bar_boost_bg = _hud_rect(Vector2(18, 110), Vector2(260, 6), Color(0.10, 0.06, 0.04))
+	bar_boost_fill = _hud_rect(Vector2(18, 110), Vector2(260, 6), Color(1.0, 0.65, 0.25))
+
+	lbl_wave = _hud_label("", Vector2(560, 14), 20, COL_TEXT)
+	lbl_wave.size = Vector2(160, 28)
+	lbl_wave.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+
+	lbl_time = _hud_label("", Vector2(1140, 14), 14, COL_DIM)
+	lbl_time.size = Vector2(120, 22)
+	lbl_time.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+
+	lbl_stats = _hud_label("", Vector2(18, 690), 11, COL_DIM)
+
+	lbl_pause = _hud_label("‖  PAUSIERT  ·  [Leer] weiter", Vector2(0, 340), 22, Color(1.0, 0.9, 0.4))
+	lbl_pause.size = Vector2(1280, 40)
+	lbl_pause.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lbl_pause.visible = false
+
+	# Radar mini-map bottom-right
+	radar = RadarPanel.new()
+	radar.main = self
+	radar.size = Vector2(radar.radius_pixels * 2.0, radar.radius_pixels * 2.0)
+	radar.position = Vector2(1280 - radar.size.x - 20, 720 - radar.size.y - 20)
+	radar.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hud.add_child(radar)
+
+func _hud_label(text: String, pos: Vector2, size: int, col: Color) -> Label:
+	var l := Label.new()
+	l.text = text
+	l.position = pos
+	l.add_theme_color_override("font_color", col)
+	l.add_theme_font_size_override("font_size", size)
+	hud.add_child(l)
+	return l
+
+func _hud_rect(pos: Vector2, size: Vector2, col: Color) -> ColorRect:
+	var r := ColorRect.new()
+	r.position = pos
+	r.size = size
+	r.color = col
+	r.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hud.add_child(r)
+	return r
+
+func _update_ui_text() -> void:
+	lbl_hp.text = "HÜLLE   %d / %d" % [max(0, p_hp), p_max_hp]
+	bar_hp_fill.size = Vector2(260.0 * clamp(float(p_hp) / float(p_max_hp), 0.0, 1.0), 12)
+	var need: int = _xp_for_next()
+	lbl_xp.text = "LV %d   ·   %d / %d XP" % [p_level, p_xp, need]
+	bar_xp_fill.size = Vector2(260.0 * clamp(float(p_xp) / float(need), 0.0, 1.0), 8)
+	# Boost bar — width by current charge, color flashes brighter while boosting
+	var boost_frac: float = clamp(boost_charge / max(u_boost_max, 0.01), 0.0, 1.0)
+	bar_boost_fill.size = Vector2(260.0 * boost_frac, 6)
+	bar_boost_fill.color = Color(1.0, 0.9, 0.45) if boosting else Color(1.0, 0.65, 0.25)
+	lbl_wave.text = "WELLE %d   %ds" % [wave, max(0, int(ceil(wave_timer)))]
+	lbl_time.text = "%02d:%02d" % [int(run_time) / 60, int(run_time) % 60]
+	lbl_stats.text = "Schaden %d  ·  Schüsse %d  ·  Feuerrate %.0f%%  ·  Reichweite %.0f%%  ·  Tempo %.0f%%  ·  Durchschlag %d  ·  Kills %d" % [
+		u_damage, u_projectiles, u_fire_rate_mult * 100.0,
+		u_range_mult * 100.0, u_speed_mult * 100.0,
+		u_pierce, kills
+	]
+
+# ============================================================
+# Level-up panel
+# ============================================================
+
+func _build_levelup_panel() -> void:
+	levelup_panel = Control.new()
+	levelup_panel.size = Vector2(1280, 720)
+	levelup_panel.visible = false
+	hud.add_child(levelup_panel)
+
+	var bg := ColorRect.new()
+	bg.size = Vector2(1280, 720)
+	bg.color = Color(0.0, 0.0, 0.02, 0.72)
+	levelup_panel.add_child(bg)
+
+	var title := Label.new()
+	title.text = "LEVEL UP"
+	title.position = Vector2(0, 180)
+	title.size = Vector2(1280, 50)
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.add_theme_color_override("font_color", Color(0.5, 1.0, 1.0))
+	title.add_theme_font_size_override("font_size", 44)
+	levelup_panel.add_child(title)
+
+	var sub := Label.new()
+	sub.text = "Wähle eine Verstärkung"
+	sub.position = Vector2(0, 234)
+	sub.size = Vector2(1280, 30)
+	sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	sub.add_theme_color_override("font_color", COL_DIM)
+	sub.add_theme_font_size_override("font_size", 16)
+	levelup_panel.add_child(sub)
+
+	var bw: float = 320.0
+	var bh: float = 100.0
+	var gap: float = 40.0
+	var total_w: float = bw * 3 + gap * 2
+	var start_x: float = (1280 - total_w) * 0.5
+	for i in 3:
+		var b := Button.new()
+		b.position = Vector2(start_x + i * (bw + gap), 320)
+		b.size = Vector2(bw, bh)
+		b.add_theme_font_size_override("font_size", 16)
+		b.pressed.connect(_on_levelup_pick.bind(i))
+		levelup_panel.add_child(b)
+		levelup_buttons.append(b)
+
+func _build_go_panel() -> void:
+	go_panel = Control.new()
+	go_panel.size = Vector2(1280, 720)
+	go_panel.visible = false
+	hud.add_child(go_panel)
+	var bg := ColorRect.new()
+	bg.size = Vector2(1280, 720)
+	bg.color = Color(0.0, 0.0, 0.0, 0.82)
+	go_panel.add_child(bg)
+	go_title = Label.new()
+	go_title.position = Vector2(0, 240)
+	go_title.size = Vector2(1280, 80)
+	go_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	go_title.add_theme_font_size_override("font_size", 64)
+	go_panel.add_child(go_title)
+	go_detail = Label.new()
+	go_detail.position = Vector2(0, 360)
+	go_detail.size = Vector2(1280, 200)
+	go_detail.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	go_detail.add_theme_color_override("font_color", COL_DIM)
+	go_detail.add_theme_font_size_override("font_size", 18)
+	go_panel.add_child(go_detail)
+	var restart_btn := Button.new()
+	restart_btn.text = "Neuer Run"
+	restart_btn.position = Vector2(540, 540)
+	restart_btn.size = Vector2(200, 50)
+	restart_btn.add_theme_font_size_override("font_size", 18)
+	restart_btn.pressed.connect(_restart_run)
+	go_panel.add_child(restart_btn)
