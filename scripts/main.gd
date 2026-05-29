@@ -6,6 +6,10 @@ extends Node3D
 # upgrade attachments (turrets, sensors, fins, etc.).
 # ============================================================
 
+# Bumped on every release; the self-updater compares this against the
+# latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
+const GAME_VERSION := "0.1.0"
+
 const MODEL_PLAYER_BASE   := preload("res://assets/ships/craft_racer.glb")
 const MODEL_TURRET_SINGLE := preload("res://assets/ships/turret_single.glb")
 const MODEL_TURRET_DOUBLE := preload("res://assets/ships/turret_double.glb")
@@ -4587,6 +4591,10 @@ func _build_hud() -> void:
 	lbl_pause.size = Vector2(1280, 40)
 	lbl_pause.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	lbl_pause.visible = false
+
+	var lbl_ver := _hud_label("v" + GAME_VERSION, Vector2(1130, 700), 10, Color(0.45, 0.55, 0.7))
+	lbl_ver.size = Vector2(130, 16)
+	lbl_ver.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 
 	# Radar mini-map bottom-right
 	radar = RadarPanel.new()
