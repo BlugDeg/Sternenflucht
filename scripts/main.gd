@@ -383,6 +383,18 @@ var go_panel: Control
 var go_title: Label
 var go_detail: Label
 
+# Self-updater (GitHub Releases). Only active in exported builds, never in
+# the editor or on a dedicated server.
+const UPDATE_REPO := "BlugDeg/Sternenflucht"
+var http_check: HTTPRequest = null
+var http_download: HTTPRequest = null
+var updater_layer: CanvasLayer = null
+var updater_label: Label = null
+var updater_btn_yes: Button = null
+var updater_btn_no: Button = null
+var update_asset_url: String = ""   # browser_download_url of the new Sternenflucht.exe
+var update_new_version: String = ""
+
 # ============================================================
 # Lifecycle
 # ============================================================
@@ -403,6 +415,10 @@ func _ready() -> void:
 	_build_levelup_panel()
 	_build_go_panel()
 	p_hp = p_max_hp
+	_build_updater_ui()
+	# Only check for updates from a real exported build (skip editor & server).
+	if not OS.has_feature("editor") and not OS.has_feature("dedicated_server"):
+		_check_for_updates()
 
 func _build_audio() -> void:
 	# Procedural laser zap — descending frequency, exponential decay envelope.
@@ -4716,3 +4732,153 @@ func _build_go_panel() -> void:
 	restart_btn.add_theme_font_size_override("font_size", 18)
 	restart_btn.pressed.connect(_restart_run)
 	go_panel.add_child(restart_btn)
+
+# ============================================================
+# Self-updater — checks GitHub Releases, downloads the new exe, and
+# swaps it in via a helper batch on the next launch.
+# Releases are tagged "v<GAME_VERSION>" and carry one asset named
+# "Sternenflucht.exe" (the single embedded-pck build).
+# ============================================================
+
+func _build_updater_ui() -> void:
+	updater_layer = CanvasLayer.new()
+	updater_layer.layer = 100   # above the HUD
+	add_child(updater_layer)
+	var panel := ColorRect.new()
+	panel.name = "panel"
+	panel.color = Color(0.04, 0.06, 0.12, 0.92)
+	panel.position = Vector2(340, 8)
+	panel.size = Vector2(600, 40)
+	updater_layer.add_child(panel)
+	updater_label = Label.new()
+	updater_label.position = Vector2(12, 0)
+	updater_label.size = Vector2(380, 40)
+	updater_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	updater_label.add_theme_font_size_override("font_size", 13)
+	updater_label.add_theme_color_override("font_color", Color(0.85, 0.92, 1.0))
+	panel.add_child(updater_label)
+	updater_btn_yes = Button.new()
+	updater_btn_yes.text = "Aktualisieren"
+	updater_btn_yes.position = Vector2(400, 6)
+	updater_btn_yes.size = Vector2(110, 28)
+	updater_btn_yes.add_theme_font_size_override("font_size", 12)
+	updater_btn_yes.pressed.connect(_on_update_accept)
+	panel.add_child(updater_btn_yes)
+	updater_btn_no = Button.new()
+	updater_btn_no.text = "Später"
+	updater_btn_no.position = Vector2(516, 6)
+	updater_btn_no.size = Vector2(72, 28)
+	updater_btn_no.add_theme_font_size_override("font_size", 12)
+	updater_btn_no.pressed.connect(_on_update_dismiss)
+	panel.add_child(updater_btn_no)
+	updater_layer.visible = false   # hidden until an update is found
+
+	http_check = HTTPRequest.new()
+	add_child(http_check)
+	http_check.request_completed.connect(_on_version_check_completed)
+	http_download = HTTPRequest.new()
+	add_child(http_download)
+	http_download.request_completed.connect(_on_update_download_completed)
+
+func _check_for_updates() -> void:
+	var url := "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+	# GitHub requires a User-Agent; the Accept header pins the API version.
+	var headers := ["User-Agent: Sternenflucht-Updater",
+		"Accept: application/vnd.github+json"]
+	var err := http_check.request(url, headers)
+	if err != OK:
+		push_warning("Update-Check fehlgeschlagen (request): %d" % err)
+
+func _on_version_check_completed(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	if result != HTTPRequest.RESULT_SUCCESS or code != 200:
+		push_warning("Update-Check: HTTP %d (result %d)" % [code, result])
+		return
+	var data: Variant = JSON.parse_string(body.get_string_from_utf8())
+	if typeof(data) != TYPE_DICTIONARY:
+		push_warning("Update-Check: ungültige Antwort")
+		return
+	var tag := String(data.get("tag_name", ""))
+	var remote_ver := tag.lstrip("v")
+	if remote_ver == "" or not _version_is_newer(remote_ver, GAME_VERSION):
+		return   # already up to date
+	# Find the Windows exe asset.
+	var dl_url := ""
+	for a in data.get("assets", []):
+		if String(a.get("name", "")) == "Sternenflucht.exe":
+			dl_url = String(a.get("browser_download_url", ""))
+			break
+	if dl_url == "":
+		push_warning("Update %s gefunden, aber kein Sternenflucht.exe-Asset" % tag)
+		return
+	update_new_version = remote_ver
+	update_asset_url = dl_url
+	_show_update_banner()
+
+# Returns true if semver string `a` is strictly newer than `b`.
+func _version_is_newer(a: String, b: String) -> bool:
+	var pa := a.split(".")
+	var pb := b.split(".")
+	for i in range(max(pa.size(), pb.size())):
+		var na := int(pa[i]) if i < pa.size() else 0
+		var nb := int(pb[i]) if i < pb.size() else 0
+		if na != nb:
+			return na > nb
+	return false
+
+func _show_update_banner() -> void:
+	updater_label.text = "Neue Version v%s verfügbar (du hast v%s)" % [update_new_version, GAME_VERSION]
+	updater_btn_yes.disabled = false
+	updater_layer.visible = true
+
+func _on_update_dismiss() -> void:
+	updater_layer.visible = false
+
+func _on_update_accept() -> void:
+	if update_asset_url == "":
+		return
+	updater_btn_yes.disabled = true
+	updater_label.text = "Lade v%s …" % update_new_version
+	var target := OS.get_executable_path().get_base_dir().path_join("Sternenflucht_update.exe")
+	http_download.download_file = target
+	var headers := ["User-Agent: Sternenflucht-Updater"]
+	var err := http_download.request(update_asset_url, headers)
+	if err != OK:
+		updater_label.text = "Download fehlgeschlagen (%d)" % err
+		updater_btn_yes.disabled = false
+
+func _on_update_download_completed(result: int, code: int, _headers: PackedStringArray, _body: PackedByteArray) -> void:
+	if result != HTTPRequest.RESULT_SUCCESS or (code != 200 and code != 0):
+		updater_label.text = "Download fehlgeschlagen (HTTP %d)" % code
+		updater_btn_yes.disabled = false
+		return
+	updater_label.text = "Installiere v%s, starte neu …" % update_new_version
+	_apply_update_and_restart()
+
+# A running exe can't overwrite itself on Windows, so we spawn a detached
+# batch that waits for this process to exit, swaps the file, and relaunches.
+func _apply_update_and_restart() -> void:
+	var exe_path := OS.get_executable_path()
+	var dir := exe_path.get_base_dir()
+	var new_exe := dir.path_join("Sternenflucht_update.exe")
+	var bat_path := dir.path_join("apply_update.bat")
+	var pid := OS.get_process_id()
+	var bat := "@echo off\r\n"
+	bat += ":waitloop\r\n"
+	bat += "tasklist /FI \"PID eq %d\" 2>nul | find \"%d\" >nul\r\n" % [pid, pid]
+	bat += "if not errorlevel 1 (\r\n"
+	bat += "  timeout /t 1 /nobreak >nul\r\n"
+	bat += "  goto waitloop\r\n"
+	bat += ")\r\n"
+	bat += "move /Y \"%s\" \"%s\" >nul\r\n" % [new_exe.replace("/", "\\"), exe_path.replace("/", "\\")]
+	bat += "start \"\" \"%s\"\r\n" % exe_path.replace("/", "\\")
+	bat += "del \"%~f0\"\r\n"
+	var f := FileAccess.open(bat_path, FileAccess.WRITE)
+	if f == null:
+		updater_label.text = "Update fehlgeschlagen (Schreibrechte?)"
+		updater_btn_yes.disabled = false
+		return
+	f.store_string(bat)
+	f.close()
+	# Launch the helper detached, then quit so it can replace this exe.
+	OS.create_process("cmd.exe", ["/c", "start", "", "/min", bat_path.replace("/", "\\")])
+	get_tree().quit()
