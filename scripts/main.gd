@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.4"
+const GAME_VERSION := "0.3.5"
 
 
 # Arena (in world units)
@@ -98,6 +98,7 @@ class Entity:
 	var net_id: int = 0       # server-assigned network id (0 = local/single-player)
 	var is_mega: bool = false # enemy: special hidden mega-boss world event (radar marker + big reward)
 	var marked: bool = false  # enemy: part of an escort event — targets the rescued bot, not the player
+	var far_timer: float = 0.0 # authority: seconds spent outside every player's radar (far-despawn)
 	var dna: Dictionary = {}  # enemy: procedural recipe, sent to clients so they rebuild the mesh
 	var owner_id: int = 0     # player bullet: peer id of the player who fired it
 	var tpos: Vector3 = Vector3.ZERO  # client: target position from the latest snapshot (lerp toward)
@@ -748,6 +749,7 @@ func _server_sim(delta: float) -> void:
 	_server_update_waves(delta)
 	_update_events(delta)
 	_server_resolve_collisions()
+	_cleanup_far_entities(delta)
 	_purge_dead()
 
 # Closest connected player's position to a point (enemy AI target). Returns a far
@@ -2030,6 +2032,7 @@ func _process(delta: float) -> void:
 		_update_wave(delta)
 		_update_events(delta)
 		_resolve_collisions()
+		_cleanup_far_entities(delta)
 		_purge_dead()
 		_check_lightning_strikes(delta)
 	_update_shake(delta)
@@ -4154,6 +4157,44 @@ func _reset_events() -> void:
 	event_timer = randf_range(EVENT_INTERVAL_MIN, EVENT_INTERVAL_MAX)
 	_set_objective("")
 
+# Despawn wave enemies + gems that have been outside EVERY player's radar range
+# for FAR_DESPAWN_TIME, so the persistent world doesn't pile up leftovers. Event
+# entities (mega-boss, escort markers, friendly bot) manage their own lifecycle.
+func _cleanup_far_entities(delta: float) -> void:
+	if net_mode == NetMode.CLIENT:
+		return
+	for e in enemies:
+		if e.dead or e.is_mega or e.marked:
+			continue
+		if _min_player_dist(e.pos) > FAR_DESPAWN_RANGE:
+			e.far_timer += delta
+			if e.far_timer >= FAR_DESPAWN_TIME:
+				e.dead = true
+				if net_mode == NetMode.SERVER:
+					despawn_enemy.rpc(e.net_id)   # clients drop their mirror; _purge_dead clears the array
+		else:
+			e.far_timer = 0.0
+	for g in gems:
+		if g.dead:
+			continue
+		if _min_player_dist(g.pos) > FAR_DESPAWN_RANGE:
+			g.far_timer += delta
+			if g.far_timer >= FAR_DESPAWN_TIME:
+				g.dead = true   # server: dropped from the next snapshot; single: freed by _purge_dead
+		else:
+			g.far_timer = 0.0
+
+# Distance to the nearest player (all connected players on the server, the local
+# player otherwise). INF when nobody is present.
+func _min_player_dist(pos: Vector3) -> float:
+	if net_mode == NetMode.SERVER:
+		var best: float = INF
+		for id in net_states:
+			var pp: Vector3 = net_states[id]["pos"]
+			best = minf(best, pp.distance_to(pos))
+		return best
+	return p_pos.distance_to(pos)
+
 # Show a transient banner: broadcast from the server, local on single-player.
 func _event_announce(text: String) -> void:
 	if net_mode == NetMode.SERVER:
@@ -4831,6 +4872,11 @@ const ESCORT_GEMS := 30                     # loot shower on success
 # Shared event cadence (one world event — mega OR escort — at a time).
 const EVENT_INTERVAL_MIN := 80.0
 const EVENT_INTERVAL_MAX := 150.0
+
+# Far-entity cleanup: wave enemies + gems outside every player's radar for this
+# long get despawned, so the persistent world doesn't accumulate leftovers.
+const FAR_DESPAWN_RANGE := 90.0             # just beyond radar (~80) = off everyone's screen
+const FAR_DESPAWN_TIME := 120.0             # 2 minutes outside all radars → despawn
 
 func _make_proc_hull_mat(c: Color) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
@@ -6313,7 +6359,16 @@ func _on_give_up_pressed() -> void:
 # Co-op restart: leave the server-owned world untouched (enemies/bullets/gems keep
 # streaming in) — just reset our own progression and rejoin with a grace window.
 func _coop_restart() -> void:
+	# Respawn FAR from the death spot — the server-owned swarm (and boss/gems) that
+	# killed us is still there, so reappearing in place is instant death. Jump to a
+	# fresh area well beyond radar/aggro range; the world is open + infinite, and the
+	# stuff we leave behind despawns via _cleanup_far_entities after ~2 min.
+	var ang: float = randf() * TAU
+	p_pos += Vector3(cos(ang), sin(ang), 0) * randf_range(300.0, 450.0)
+	p_vel = Vector3.ZERO
 	_reset_player_progression()
+	if p_node != null:
+		p_node.position = p_pos
 	run_time = 0.0
 	kills = 0
 	wave = 1
