@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.0"
+const GAME_VERSION := "0.3.1"
 
 
 # Arena (in world units)
@@ -993,6 +993,14 @@ func _sanitize_ship_design(d: Dictionary) -> Dictionary:
 	out["palette"] = clampi(int(d.get("palette", 0)), 0, SHIP_PALETTES.size() - 1)
 	var w := str(d.get("wings", "swept"))
 	out["wings"] = w if w in SHIP_WING_OPTS else "swept"
+	var en := int(d.get("engines", 2))
+	out["engines"] = en if en in SHIP_ENGINE_OPTS else 2
+	var t := str(d.get("tail", "twin"))
+	out["tail"] = t if t in SHIP_TAIL_OPTS else "twin"
+	var n := str(d.get("nose", "pointed"))
+	out["nose"] = n if n in SHIP_NOSE_OPTS else "pointed"
+	var l := str(d.get("leds", "auto"))
+	out["leds"] = l if l in SHIP_LED_OPTS else "auto"
 	return out
 
 # id -> ship_design for every connected player.
@@ -2727,6 +2735,17 @@ func _build_player() -> void:
 	# (Everything else attaches to ship_render, not p_node.)
 	_assemble_ship_body()
 
+# Unshaded emissive material for an engine plasma glow (brightness animated by
+# _animate_ship_lights). Shared shape for the port/starboard engine mats.
+func _make_engine_glow_mat(c: Color) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = c
+	m.emission_enabled = true
+	m.emission = c
+	m.emission_energy_multiplier = 5.5
+	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	return m
+
 # Builds all ship meshes + lights into the member `ship_render` and registers
 # pulse-light / engine / boost materials on member vars. Split out of
 # _build_player so a standalone copy can be made for remote co-op players via
@@ -2741,6 +2760,10 @@ func _assemble_ship_body() -> void:
 	var pal_accent: Color = pal["accent"]
 	var pal_glow: Color = pal["glow"]
 	var pal_engine: Color = pal["engine"]
+	# LED accent: "auto" follows the palette glow; a named colour overrides the
+	# glowing edge strips + cockpit console (nav-tip lights keep red/green identity).
+	var led_key: String = str(ship_design.get("leds", "auto"))
+	var led_col: Color = pal_glow if led_key == "auto" else SHIP_LED_COLORS.get(led_key, pal_glow)
 
 	# ===== Materials =====
 	# Stealth-paint hull — desaturated slate-blue, clearcoat over metallic
@@ -2812,11 +2835,12 @@ func _assemble_ship_body() -> void:
 	mat_panel_line.metallic = 0.2
 	mat_panel_line.roughness = 0.8
 
-	# Cyan glowing strip — wing leading edges, intake lips, accent seams
+	# Glowing accent strip — wing leading edges, intake lips, vstab edges, seams.
+	# Driven by the LED accent colour (defaults to the palette glow).
 	var mat_panel_glow := StandardMaterial3D.new()
-	mat_panel_glow.albedo_color = pal_glow.lightened(0.3)
+	mat_panel_glow.albedo_color = led_col.lightened(0.3)
 	mat_panel_glow.emission_enabled = true
-	mat_panel_glow.emission = pal_glow
+	mat_panel_glow.emission = led_col
 	mat_panel_glow.emission_energy_multiplier = 2.6
 	mat_panel_glow.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 
@@ -2865,27 +2889,44 @@ func _assemble_ship_body() -> void:
 	fwd.position = Vector3(0.43, -0.01, 0)
 	ship_render.add_child(fwd)
 
-	# Sharp pointed nose — flat prism, low height for sleek profile
+	# Nose — design-driven (ship_design.nose). "pointed" = sharp prism + pitot,
+	# "blade" = longer/thinner spike + pitot, "blunt" = stubby capped box, no pitot.
+	var nose_kind: String = str(ship_design.get("nose", "pointed"))
 	var nose := MeshInstance3D.new()
-	var npm := PrismMesh.new()
-	npm.size = Vector3(0.20, 0.30, 0.13); npm.material = mat_hull
-	nose.mesh = npm
-	# Lay prism flat (rotate -90° X so point originally +Y now points +Z, then
-	# rotate Y by -90° so point faces +X). Combined: rotation_degrees with Z=-90
-	# keeps the prism standing but with point along +X.
-	nose.rotation_degrees = Vector3(0, 0, -90)
-	nose.position = Vector3(0.69, 0, 0)
+	var nose_has_pitot: bool = true
+	var pitot_x: float = 0.91
+	var pitot_len: float = 0.14
+	if nose_kind == "blunt":
+		var nbm := BoxMesh.new()
+		nbm.size = Vector3(0.18, 0.15, 0.22); nbm.material = mat_hull
+		nose.mesh = nbm
+		nose.position = Vector3(0.60, 0.0, 0)
+		nose_has_pitot = false
+	else:
+		var npm := PrismMesh.new()
+		if nose_kind == "blade":
+			npm.size = Vector3(0.15, 0.46, 0.09)
+			nose.position = Vector3(0.72, 0, 0)
+			pitot_x = 1.02; pitot_len = 0.20
+		else:  # pointed (default)
+			npm.size = Vector3(0.20, 0.30, 0.13)
+			nose.position = Vector3(0.69, 0, 0)
+		npm.material = mat_hull
+		nose.mesh = npm
+		# Lay prism flat with its point along +X (Z=-90; see original derivation).
+		nose.rotation_degrees = Vector3(0, 0, -90)
 	ship_render.add_child(nose)
 
-	# Pitot tube — sharp needle at the very tip
-	var pitot := MeshInstance3D.new()
-	var pitm := CylinderMesh.new()
-	pitm.top_radius = 0.006; pitm.bottom_radius = 0.010; pitm.height = 0.14
-	pitm.material = mat_dark
-	pitot.mesh = pitm
-	pitot.rotation_degrees = Vector3(0, 0, 90)
-	pitot.position = Vector3(0.91, 0, 0)
-	ship_render.add_child(pitot)
+	# Pitot tube — sharp needle at the tip (skipped on the blunt nose).
+	if nose_has_pitot:
+		var pitot := MeshInstance3D.new()
+		var pitm := CylinderMesh.new()
+		pitm.top_radius = 0.006; pitm.bottom_radius = 0.010; pitm.height = pitot_len
+		pitm.material = mat_dark
+		pitot.mesh = pitm
+		pitot.rotation_degrees = Vector3(0, 0, 90)
+		pitot.position = Vector3(pitot_x, 0, 0)
+		ship_render.add_child(pitot)
 
 	# Rear section — wider flat box housing the twin engines
 	var rear := MeshInstance3D.new()
@@ -2946,9 +2987,9 @@ func _assemble_ship_body() -> void:
 
 	# Cockpit interior glow — pilot HUD strip
 	var console_mat := StandardMaterial3D.new()
-	console_mat.albedo_color = pal_glow
+	console_mat.albedo_color = led_col
 	console_mat.emission_enabled = true
-	console_mat.emission = pal_glow
+	console_mat.emission = led_col
 	console_mat.emission_energy_multiplier = 3.0
 	console_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	var console := MeshInstance3D.new()
@@ -3059,77 +3100,73 @@ func _assemble_ship_body() -> void:
 	# ============================================================
 	#                TWIN VERTICAL STABILIZERS (F-22 canted)
 	# ============================================================
-	# Smaller, more outward-canted than before for the aggressive look.
-	for sign_v in [-1, 1]:
+	# Tail design (ship_design.tail): "twin" = two canted stabs, "single" = one
+	# upright centre stab, "none" = no tail. Each spec carries the stab z, the
+	# glow-strip z (sits a bit further outboard), and the outward cant angle.
+	var tail_kind: String = str(ship_design.get("tail", "twin"))
+	var tail_specs: Array = []
+	match tail_kind:
+		"twin":
+			tail_specs = [{"z": -0.20, "vz": -0.26, "cant": -28.0}, {"z": 0.20, "vz": 0.26, "cant": 28.0}]
+		"single":
+			tail_specs = [{"z": 0.0, "vz": 0.0, "cant": 0.0}]
+	for spec in tail_specs:
+		var t_z: float = spec["z"]
+		var t_vz: float = spec["vz"]
+		var t_cant: float = spec["cant"]
 		var vstab := MeshInstance3D.new()
 		var vpm := PrismMesh.new()
 		vpm.size = Vector3(0.34, 0.34, 0.04); vpm.material = mat_hull
 		vstab.mesh = vpm
-		vstab.position = Vector3(-0.55, 0.14, sign_v * 0.20)
-		# Steeper sweep (-12°) + more outward cant (28°)
-		vstab.rotation_degrees = Vector3(0, -12, sign_v * 28)
+		vstab.position = Vector3(-0.55, 0.14, t_z)
+		# Steeper sweep (-12°) + outward cant (per spec)
+		vstab.rotation_degrees = Vector3(0, -12, t_cant)
 		ship_render.add_child(vstab)
 		# Leading-edge glow strip
 		var vfg := MeshInstance3D.new()
 		var vfgm := BoxMesh.new()
 		vfgm.size = Vector3(0.24, 0.016, 0.02); vfgm.material = mat_panel_glow
 		vfg.mesh = vfgm
-		vfg.position = Vector3(-0.45, 0.32, sign_v * 0.26)
-		vfg.rotation_degrees = Vector3(0, -12, sign_v * 28)
+		vfg.position = Vector3(-0.45, 0.32, t_vz)
+		vfg.rotation_degrees = Vector3(0, -12, t_cant)
 		ship_render.add_child(vfg)
 
 	# ============================================================
-	#               TWIN ENGINE NOZZLES + BOOST FLAMES
+	#            ENGINE NOZZLES + BOOST FLAMES (design-driven count)
 	# ============================================================
-	# Two parallel engine bells, shared material so they pulse in unison
-	# via _animate_ship_lights.
-	# Bells (dark housing, no pulsing): symmetric loop is safe
-	for sign_v in [-1, 1]:
+	# ship_design.engines (1/2/3) → engine z-offsets. The two animated glow mats
+	# (port/starboard) are ALWAYS created so _animate_ship_lights stays null-safe;
+	# a centre engine reuses the port mat.
+	var eng_count: int = clampi(int(ship_design.get("engines", 2)), 1, 3)
+	var eng_z: Array = [0.0] if eng_count == 1 else ([-0.14, 0.14] if eng_count == 2 else [-0.22, 0.0, 0.22])
+	# Bells (dark housing, no pulsing): one per engine
+	for ez in eng_z:
 		var bell := MeshInstance3D.new()
 		var bellm := BoxMesh.new()
 		bellm.size = Vector3(0.20, 0.18, 0.18); bellm.material = mat_dark
 		bell.mesh = bellm
-		bell.position = Vector3(-0.78, -0.02, sign_v * 0.14)
+		bell.position = Vector3(-0.78, -0.02, ez)
 		ship_render.add_child(bell)
 
-	# Engine plasma glows: built EXPLICITLY per side, no loop, no array.
-	# Each has its own material AND its own mesh resource. _animate_ship_lights
-	# updates p_engine_mat_port and p_engine_mat_starboard with two separate
-	# explicit assignments — there is no shared state that could fall out of sync.
-
-	# Port (left from cockpit pov; z = -0.14 in airplane frame)
-	p_engine_mat_port = StandardMaterial3D.new()
-	p_engine_mat_port.albedo_color = pal_engine
-	p_engine_mat_port.emission_enabled = true
-	p_engine_mat_port.emission = pal_engine
-	p_engine_mat_port.emission_energy_multiplier = 5.5
-	p_engine_mat_port.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	var eg_port := MeshInstance3D.new()
-	var egm_port := SphereMesh.new()
-	egm_port.radius = 0.10
-	egm_port.height = 0.20
-	eg_port.mesh = egm_port
-	eg_port.material_override = p_engine_mat_port
-	eg_port.position = Vector3(-0.92, -0.02, -0.14)
-	ship_render.add_child(eg_port)
-
-	# Starboard (right; z = +0.14)
-	p_engine_mat_starboard = StandardMaterial3D.new()
-	p_engine_mat_starboard.albedo_color = pal_engine
-	p_engine_mat_starboard.emission_enabled = true
-	p_engine_mat_starboard.emission = pal_engine
-	p_engine_mat_starboard.emission_energy_multiplier = 5.5
-	p_engine_mat_starboard.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	var eg_starboard := MeshInstance3D.new()
-	var egm_starboard := SphereMesh.new()
-	egm_starboard.radius = 0.10
-	egm_starboard.height = 0.20
-	eg_starboard.mesh = egm_starboard
-	eg_starboard.material_override = p_engine_mat_starboard
-	eg_starboard.position = Vector3(-0.92, -0.02, 0.14)
-	ship_render.add_child(eg_starboard)
-
-	p_engine_glow = eg_starboard
+	# Engine plasma glows: the two animated materials are created up-front (the
+	# animation drives BOTH, regardless of count), then one glow sphere is built
+	# per engine — z<0 uses the port mat, z>0 the starboard mat, a centre engine
+	# (z==0) the port mat. _animate_ship_lights updates port + starboard with two
+	# separate explicit assignments, so there is no shared state to fall out of sync.
+	p_engine_mat_port = _make_engine_glow_mat(pal_engine)
+	p_engine_mat_starboard = _make_engine_glow_mat(pal_engine)
+	p_engine_glow = null
+	for ez in eng_z:
+		var egmat: StandardMaterial3D = p_engine_mat_starboard if ez > 0.0 else p_engine_mat_port
+		var eg := MeshInstance3D.new()
+		var egm := SphereMesh.new()
+		egm.radius = 0.10
+		egm.height = 0.20
+		eg.mesh = egm
+		eg.material_override = egmat
+		eg.position = Vector3(-0.92, -0.02, ez)
+		ship_render.add_child(eg)
+		p_engine_glow = eg   # boost-pulse scales the last (rightmost) glow sphere
 	p_engine_glow_mat = p_engine_mat_starboard
 
 	# Boost flame container — twin flames, scale-driven length, shared material.
@@ -3155,7 +3192,7 @@ func _assemble_ship_body() -> void:
 	bfmat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
 	p_boost_flame_mat = bfmat
 	var flame_len: float = 0.9
-	for sign_v in [-1, 1]:
+	for ez in eng_z:
 		var bf := MeshInstance3D.new()
 		var bfm := CylinderMesh.new()
 		# Cone: wide at the nozzle, tapering to a point at the rear of the flame.
@@ -3169,8 +3206,8 @@ func _assemble_ship_body() -> void:
 		# and local -Y (bottom = wide nozzle face) becomes world +X (toward nozzle).
 		bf.rotation_degrees = Vector3(0, 0, 90)
 		# Offset rearward so the cone's wide face lands exactly on container origin
-		# (= nozzle exit at world x=-0.88).
-		bf.position = Vector3(-flame_len * 0.5, 0, sign_v * 0.14)
+		# (= nozzle exit at world x=-0.88); one flame per engine.
+		bf.position = Vector3(-flame_len * 0.5, 0, ez)
 		p_boost_flame.add_child(bf)
 
 	# ============================================================
@@ -4229,9 +4266,39 @@ const SHIP_PALETTES := [
 ]
 const SHIP_WING_OPTS := ["swept", "delta", "long", "none"]
 const SHIP_WING_LABELS := {"swept": "Pfeilflügel", "delta": "Delta", "long": "Lang", "none": "Keine"}
+const SHIP_ENGINE_OPTS := [1, 2, 3]
+const SHIP_TAIL_OPTS := ["twin", "single", "none"]
+const SHIP_TAIL_LABELS := {"twin": "Doppel", "single": "Einzel", "none": "Keins"}
+const SHIP_NOSE_OPTS := ["pointed", "blunt", "blade"]
+const SHIP_NOSE_LABELS := {"pointed": "Spitz", "blunt": "Stumpf", "blade": "Klinge"}
+# LED accent for the glowing edge strips + console. "auto" = follow the palette glow.
+const SHIP_LED_OPTS := ["auto", "cyan", "red", "green", "violet", "gold", "white"]
+const SHIP_LED_LABELS := {"auto": "Auto", "cyan": "Cyan", "red": "Rot", "green": "Grün", "violet": "Violett", "gold": "Gold", "white": "Weiß"}
+const SHIP_LED_COLORS := {
+	"cyan": Color(0.35, 0.80, 1.00),
+	"red": Color(1.00, 0.30, 0.25),
+	"green": Color(0.50, 1.00, 0.40),
+	"violet": Color(0.80, 0.40, 1.00),
+	"gold": Color(1.00, 0.85, 0.40),
+	"white": Color(0.85, 0.95, 1.00),
+}
+# Editor rows, in display order. Adding a new designable part = add a row here +
+# a builder branch + a cycle/label case (kept data-driven so it stays trivial).
+const SHIPYARD_ROWS := [
+	{"key": "palette", "label": "Farbschema"},
+	{"key": "wings", "label": "Flügel"},
+	{"key": "engines", "label": "Triebwerke"},
+	{"key": "tail", "label": "Leitwerk"},
+	{"key": "nose", "label": "Nase"},
+	{"key": "leds", "label": "LED-Farbe"},
+]
 const DEFAULT_SHIP_DESIGN := {
 	"palette": 0,
 	"wings": "swept",
+	"engines": 2,
+	"tail": "twin",
+	"nose": "pointed",
+	"leds": "auto",
 }
 
 func _make_proc_hull_mat(c: Color) -> StandardMaterial3D:
@@ -6617,26 +6684,26 @@ func _build_shipyard_panel() -> void:
 
 	# Dark control column on the left; the ship stays framed in the centre.
 	var col := ColorRect.new()
-	col.position = Vector2(40, 120)
-	col.size = Vector2(360, 470)
+	col.position = Vector2(40, 92)
+	col.size = Vector2(360, 596)
 	col.color = Color(0.0, 0.02, 0.06, 0.82)
 	col.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	shipyard_panel.add_child(col)
 
 	var title := Label.new()
 	title.text = "WERKSTATT"
-	title.position = Vector2(40, 134)
+	title.position = Vector2(40, 104)
 	title.size = Vector2(360, 40)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	title.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	title.add_theme_font_size_override("font_size", 30)
+	title.add_theme_font_size_override("font_size", 28)
 	title.add_theme_color_override("font_color", Color(0.6, 0.95, 1.0))
 	shipyard_panel.add_child(title)
 
 	var hint := Label.new()
 	hint.text = "Gestalte dein Schiff – andere sehen es im Koop."
-	hint.position = Vector2(60, 176)
-	hint.size = Vector2(320, 44)
+	hint.position = Vector2(60, 144)
+	hint.size = Vector2(320, 40)
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -6644,13 +6711,16 @@ func _build_shipyard_panel() -> void:
 	hint.add_theme_color_override("font_color", COL_DIM)
 	shipyard_panel.add_child(hint)
 
+	# One row per designable part (data-driven — see SHIPYARD_ROWS).
 	shipyard_val_labels.clear()
-	_shipyard_row("palette", "Farbschema", 234)
-	_shipyard_row("wings", "Flügel", 320)
+	var ry: float = 190.0
+	for row in SHIPYARD_ROWS:
+		_shipyard_row(str(row["key"]), str(row["label"]), ry)
+		ry += 62.0
 
 	var save_btn := Button.new()
 	save_btn.text = "Speichern"
-	save_btn.position = Vector2(60, 514)
+	save_btn.position = Vector2(60, 624)
 	save_btn.size = Vector2(190, 46)
 	save_btn.add_theme_font_size_override("font_size", 18)
 	save_btn.pressed.connect(_shipyard_save)
@@ -6658,7 +6728,7 @@ func _build_shipyard_panel() -> void:
 
 	var back_btn := Button.new()
 	back_btn.text = "Verwerfen"
-	back_btn.position = Vector2(262, 514)
+	back_btn.position = Vector2(262, 624)
 	back_btn.size = Vector2(118, 46)
 	back_btn.add_theme_font_size_override("font_size", 15)
 	back_btn.pressed.connect(_shipyard_cancel)
@@ -6670,34 +6740,34 @@ func _shipyard_row(cat_key: String, title: String, y: float) -> void:
 	lbl.text = title
 	lbl.position = Vector2(60, y)
 	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	lbl.add_theme_font_size_override("font_size", 15)
+	lbl.add_theme_font_size_override("font_size", 14)
 	lbl.add_theme_color_override("font_color", COL_DIM)
 	shipyard_panel.add_child(lbl)
 
 	var left := Button.new()
 	left.text = "◀"
-	left.position = Vector2(60, y + 26)
-	left.size = Vector2(44, 40)
-	left.add_theme_font_size_override("font_size", 18)
+	left.position = Vector2(60, y + 22)
+	left.size = Vector2(42, 34)
+	left.add_theme_font_size_override("font_size", 16)
 	left.pressed.connect(_shipyard_cycle.bind(cat_key, -1))
 	shipyard_panel.add_child(left)
 
 	var val := Label.new()
-	val.position = Vector2(108, y + 26)
-	val.size = Vector2(228, 40)
+	val.position = Vector2(106, y + 22)
+	val.size = Vector2(226, 34)
 	val.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	val.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	val.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	val.add_theme_font_size_override("font_size", 18)
+	val.add_theme_font_size_override("font_size", 17)
 	val.add_theme_color_override("font_color", COL_TEXT)
 	shipyard_panel.add_child(val)
 	shipyard_val_labels[cat_key] = val
 
 	var right := Button.new()
 	right.text = "▶"
-	right.position = Vector2(340, y + 26)
-	right.size = Vector2(44, 40)
-	right.add_theme_font_size_override("font_size", 18)
+	right.position = Vector2(336, y + 22)
+	right.size = Vector2(42, 34)
+	right.add_theme_font_size_override("font_size", 16)
 	right.pressed.connect(_shipyard_cycle.bind(cat_key, 1))
 	shipyard_panel.add_child(right)
 
@@ -6720,20 +6790,51 @@ func _shipyard_cycle(cat_key: String, dir: int) -> void:
 			var pn: int = SHIP_PALETTES.size()
 			ship_design["palette"] = (int(ship_design.get("palette", 0)) + dir + pn) % pn
 		"wings":
-			var wn: int = SHIP_WING_OPTS.size()
-			var cur: int = SHIP_WING_OPTS.find(str(ship_design.get("wings", "swept")))
-			if cur < 0:
-				cur = 0
-			ship_design["wings"] = SHIP_WING_OPTS[(cur + dir + wn) % wn]
+			ship_design["wings"] = _cycle_str(SHIP_WING_OPTS, str(ship_design.get("wings", "swept")), dir)
+		"engines":
+			var en: int = SHIP_ENGINE_OPTS.size()
+			var ec: int = SHIP_ENGINE_OPTS.find(int(ship_design.get("engines", 2)))
+			if ec < 0:
+				ec = 0
+			ship_design["engines"] = SHIP_ENGINE_OPTS[(ec + dir + en) % en]
+		"tail":
+			ship_design["tail"] = _cycle_str(SHIP_TAIL_OPTS, str(ship_design.get("tail", "twin")), dir)
+		"nose":
+			ship_design["nose"] = _cycle_str(SHIP_NOSE_OPTS, str(ship_design.get("nose", "pointed")), dir)
+		"leds":
+			ship_design["leds"] = _cycle_str(SHIP_LED_OPTS, str(ship_design.get("leds", "auto")), dir)
 	_rebuild_player_ship()
 	_shipyard_refresh_labels()
 
+# Wrap-around cycle of a string option within its list.
+func _cycle_str(opts: Array, cur_val: String, dir: int) -> String:
+	var n: int = opts.size()
+	var i: int = opts.find(cur_val)
+	if i < 0:
+		i = 0
+	return str(opts[(i + dir + n) % n])
+
 func _shipyard_refresh_labels() -> void:
-	if shipyard_val_labels.has("palette"):
-		var pi: int = clampi(int(ship_design.get("palette", 0)), 0, SHIP_PALETTES.size() - 1)
-		shipyard_val_labels["palette"].text = str(SHIP_PALETTES[pi]["name"])
-	if shipyard_val_labels.has("wings"):
-		shipyard_val_labels["wings"].text = str(SHIP_WING_LABELS.get(str(ship_design.get("wings", "swept")), "—"))
+	for key in shipyard_val_labels:
+		shipyard_val_labels[key].text = _shipyard_value_text(str(key))
+
+# Human-readable current value shown in an editor row.
+func _shipyard_value_text(key: String) -> String:
+	match key:
+		"palette":
+			var pi: int = clampi(int(ship_design.get("palette", 0)), 0, SHIP_PALETTES.size() - 1)
+			return str(SHIP_PALETTES[pi]["name"])
+		"wings":
+			return str(SHIP_WING_LABELS.get(str(ship_design.get("wings", "swept")), "—"))
+		"engines":
+			return str(int(ship_design.get("engines", 2)))
+		"tail":
+			return str(SHIP_TAIL_LABELS.get(str(ship_design.get("tail", "twin")), "—"))
+		"nose":
+			return str(SHIP_NOSE_LABELS.get(str(ship_design.get("nose", "pointed")), "—"))
+		"leds":
+			return str(SHIP_LED_LABELS.get(str(ship_design.get("leds", "auto")), "—"))
+	return "—"
 
 func _shipyard_save() -> void:
 	_save_settings()
@@ -6966,11 +7067,16 @@ func _load_settings() -> void:
 		best_wave = int(cfg.get_value("best", "wave", 0))
 		best_kills = int(cfg.get_value("best", "kills", 0))
 		best_time = int(cfg.get_value("best", "time", 0))
-		# Ship design — validate against the option tables so a hand-edited or
-		# stale file can never produce an out-of-range palette / unknown wing.
-		ship_design["palette"] = clampi(int(cfg.get_value("ship", "palette", 0)), 0, SHIP_PALETTES.size() - 1)
-		var w := str(cfg.get_value("ship", "wings", "swept"))
-		ship_design["wings"] = w if w in SHIP_WING_OPTS else "swept"
+		# Ship design — read raw, then run through the same validator the server
+		# uses so a hand-edited or stale file can never produce invalid parts.
+		ship_design = _sanitize_ship_design({
+			"palette": cfg.get_value("ship", "palette", 0),
+			"wings": cfg.get_value("ship", "wings", "swept"),
+			"engines": cfg.get_value("ship", "engines", 2),
+			"tail": cfg.get_value("ship", "tail", "twin"),
+			"nose": cfg.get_value("ship", "nose", "pointed"),
+			"leds": cfg.get_value("ship", "leds", "auto"),
+		})
 	player_name = _sanitize_name(player_name)
 
 func _apply_settings() -> void:
@@ -6989,6 +7095,10 @@ func _save_settings() -> void:
 	cfg.set_value("best", "time", best_time)
 	cfg.set_value("ship", "palette", int(ship_design.get("palette", 0)))
 	cfg.set_value("ship", "wings", str(ship_design.get("wings", "swept")))
+	cfg.set_value("ship", "engines", int(ship_design.get("engines", 2)))
+	cfg.set_value("ship", "tail", str(ship_design.get("tail", "twin")))
+	cfg.set_value("ship", "nose", str(ship_design.get("nose", "pointed")))
+	cfg.set_value("ship", "leds", str(ship_design.get("leds", "auto")))
 	cfg.save(SETTINGS_FILE)
 
 # ============================================================
