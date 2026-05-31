@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.12"
+const GAME_VERSION := "0.3.13"
 
 
 # Arena (in world units)
@@ -869,8 +869,11 @@ func _server_update_gems(delta: float) -> void:
 				npp = pp
 		if np_id == -1:
 			continue
-		if nd <= P_PICKUP_RANGE:
-			g.vel = g.vel.lerp((npp - g.pos).normalized() * 20.0 * (1.5 - nd / P_PICKUP_RANGE), clamp(delta * 8.0, 0.0, 1.0))
+		# Magnet range honours the nearest player's pickup upgrade (count → 1.40^n) so the
+		# upgrade actually extends the co-op magnet and matches that player's on-ship ring.
+		var pr: float = P_PICKUP_RANGE * pow(1.40, int(net_states[np_id].get("upgrades", {}).get("pickup", 0)))
+		if nd <= pr:
+			g.vel = g.vel.lerp((npp - g.pos).normalized() * 20.0 * (1.5 - nd / pr), clamp(delta * 8.0, 0.0, 1.0))
 		else:
 			g.vel = g.vel.lerp(Vector3.ZERO, clamp(delta * 4.0, 0.0, 1.0))
 		g.pos += g.vel * delta
@@ -6665,10 +6668,15 @@ func _visual_set_pickup_ring() -> void:
 	if visual_pickup_ring != null:
 		visual_pickup_ring.queue_free()
 	visual_pickup_ring = MeshInstance3D.new()
-	var inner: float = 0.7 * u_pickup_mult
+	# Match the ACTUAL magnet radius (P_PICKUP_RANGE * u_pickup_mult, in world units).
+	# The ring is a child of ship_render under p_node, which is scaled by
+	# SHIP_SCALE_BASE * u_range_mult — so divide that out to land at the right WORLD size.
+	# (Refit from _apply_range_zoom too, so range upgrades keep it aligned.)
+	var world_r: float = P_PICKUP_RANGE * u_pickup_mult
+	var inner: float = world_r / (SHIP_SCALE_BASE * maxf(u_range_mult, 0.001))
 	var tm := TorusMesh.new()
 	tm.inner_radius = inner
-	tm.outer_radius = inner + 0.06
+	tm.outer_radius = inner + 0.06 * maxf(u_pickup_mult, 1.0)
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = Color(0.95, 0.7, 1.0)
 	mat.emission_enabled = true
