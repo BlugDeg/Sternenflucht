@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.1"
+const GAME_VERSION := "0.3.2"
 
 
 # Arena (in world units)
@@ -104,6 +104,58 @@ class Entity:
 # sweep beam that brightens contacts as it passes over them, soft glow halos
 # on every blip, rim ticks every 45°, and off-screen contacts pinned to the
 # rim. Holds a back-reference to the main script to sample game state.
+# Radial emote menu shown while ALT is held. The segment under the mouse is
+# highlighted; releasing ALT fires it (the centre deadzone = cancel). Selection
+# logic lives in the main script's _update_emote_wheel.
+class EmoteWheel extends Control:
+	var hovered: int = -1
+	var labels: Array = []
+	var wheel_center: Vector2 = Vector2(640, 360)
+	var wheel_radius: float = 150.0
+	var seg_count: int = 8
+
+	func setup(emotes: Array, font: FontFile) -> void:
+		wheel_center = size * 0.5
+		seg_count = emotes.size()
+		for i in seg_count:
+			var lbl := Label.new()
+			lbl.text = str(emotes[i])
+			lbl.size = Vector2(74, 74)
+			lbl.pivot_offset = lbl.size * 0.5
+			lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+			lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+			lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			lbl.add_theme_font_size_override("font_size", 40)
+			if font != null:
+				lbl.add_theme_font_override("font", font)
+			var ang: float = -PI / 2.0 + float(i) / float(seg_count) * TAU
+			lbl.position = wheel_center + Vector2(cos(ang), sin(ang)) * wheel_radius - lbl.size * 0.5
+			add_child(lbl)
+			labels.append(lbl)
+		_apply_hover()
+
+	func set_hovered(h: int) -> void:
+		if h == hovered:
+			return
+		hovered = h
+		_apply_hover()
+		queue_redraw()
+
+	func _apply_hover() -> void:
+		for i in labels.size():
+			var on: bool = (i == hovered)
+			labels[i].scale = Vector2(1.4, 1.4) if on else Vector2.ONE
+			labels[i].modulate = Color(1, 1, 1, 1) if on else Color(0.78, 0.84, 0.95, 0.9)
+
+	func _draw() -> void:
+		draw_circle(wheel_center, wheel_radius + 52.0, Color(0.02, 0.04, 0.08, 0.72))
+		draw_arc(wheel_center, wheel_radius + 52.0, 0.0, TAU, 80, Color(0.4, 0.7, 0.95, 0.5), 2.0)
+		draw_circle(wheel_center, 42.0, Color(0.05, 0.08, 0.13, 0.6))
+		if hovered >= 0 and seg_count > 0:
+			var ang: float = -PI / 2.0 + float(hovered) / float(seg_count) * TAU
+			var p: Vector2 = wheel_center + Vector2(cos(ang), sin(ang)) * wheel_radius
+			draw_circle(p, 46.0, Color(0.35, 0.75, 1.0, 0.35))
+
 class RadarPanel extends Control:
 	var main: Node = null
 	var radius_pixels: float = 62.0
@@ -490,6 +542,17 @@ var ship_design: Dictionary = {}          # cosmetic design; filled by _load_set
 var shipyard_panel: Control = null
 var shipyard_val_labels: Dictionary = {}  # category key -> Label showing the current option
 var _shipyard_backup: Dictionary = {}     # design snapshot on open, restored by "Verwerfen"
+
+# --- Social: emotes + chat ---
+var emoji_font: FontFile = null            # Windows Segoe UI Emoji, loaded at boot (client only)
+var emote_wheel: EmoteWheel = null         # radial menu, visible while ALT is held
+var emote_wheel_open: bool = false
+var active_emotes: Array = []              # entries: {label: Label3D, follow: int, timer: float}
+var chat_root: Control = null              # holds the chat log + input
+var chat_log_label: Label = null
+var chat_input: LineEdit = null
+var chat_typing: bool = false              # input focused → movement/fire/wheel suppressed
+var chat_messages: Array = []              # formatted "Name: text" history
 var home_probing: bool = false          # a lightweight reachability probe is in flight
 var probe_timer: float = 0.0            # connection timeout, shrinks once connected
 var home_ship_spin: float = 0.0         # turntable angle for the showcased ship
@@ -536,6 +599,8 @@ func _ready() -> void:
 	_setup_net_signals()
 	_build_home_panel()
 	_build_shipyard_panel()
+	_load_emoji_font()
+	_build_social_ui()
 	home_preferred_coop = (net_mode == NetMode.CLIENT)   # co-op .bat → pre-highlight + keep its address
 	net_mode = NetMode.SINGLE   # neutral until the player picks on the home screen
 	_show_home()
@@ -1022,6 +1087,43 @@ func request_ship_designs() -> void:
 		return
 	receive_ship_designs.rpc_id(multiplayer.get_remote_sender_id(), _build_designs())
 
+# --- Emote relay: client picks → server validates → everyone shows it ---
+@rpc("any_peer", "call_remote", "reliable")
+func submit_emote(idx: int) -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	var sender := multiplayer.get_remote_sender_id()
+	if not net_states.has(sender):
+		return
+	receive_emote.rpc(sender, clampi(idx, 0, EMOTES.size() - 1))
+
+@rpc("authority", "call_remote", "reliable")
+func receive_emote(id: int, idx: int) -> void:
+	if net_mode != NetMode.CLIENT or home_probing:
+		return
+	_show_emote_above(id, idx)
+
+# --- Chat relay: server stamps the sender's name and broadcasts to all ---
+@rpc("any_peer", "call_remote", "reliable")
+func submit_chat(text: String) -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	var sender := multiplayer.get_remote_sender_id()
+	if not net_states.has(sender):
+		return
+	var clean := text.strip_edges()
+	if clean.length() > CHAT_MAX_LEN:
+		clean = clean.substr(0, CHAT_MAX_LEN)
+	if clean.is_empty():
+		return
+	receive_chat.rpc(str(net_states[sender].get("name", "Pilot")), clean)
+
+@rpc("authority", "call_remote", "reliable")
+func receive_chat(sender_name: String, text: String) -> void:
+	if net_mode != NetMode.CLIENT or home_probing:
+		return
+	_append_chat("%s: %s" % [sender_name, text])
+
 @rpc("any_peer", "call_remote", "reliable")
 func request_highscores() -> void:
 	if net_mode != NetMode.SERVER:
@@ -1154,6 +1256,7 @@ func _on_server_disconnected() -> void:
 		remote_players[id]["node"].queue_free()
 	remote_players.clear()
 	cl_designs.clear()
+	_clear_emotes()
 	net_roster.clear()
 	if menu_open:
 		_refresh_esc_lists()
@@ -1808,6 +1911,9 @@ func _process(delta: float) -> void:
 		AudioServer.set_bus_mute(0, true)
 		_home_update(delta)
 		return
+	# Emotes + chat run in every in-run state (incl. ESC pause), so emote
+	# billboards keep floating and the wheel/chat stay responsive.
+	_update_social(delta)
 	# Co-op clients keep the world live during their own menus (level-up OR the ESC
 	# self-pause): the server keeps simulating and keeps the player invulnerable, so we
 	# only freeze their own ship. Single-player menus fully freeze the world.
@@ -1856,8 +1962,26 @@ func _process(delta: float) -> void:
 	if radar != null:
 		radar.queue_redraw()
 
+func _input(event: InputEvent) -> void:
+	# While typing in chat, ESC cancels it (handled here, before GUI/pause, so it
+	# doesn't also toggle the pause menu).
+	if not chat_typing:
+		return
+	var k := event as InputEventKey
+	if k != null and k.pressed and k.keycode == KEY_ESCAPE:
+		_close_chat()
+		get_viewport().set_input_as_handled()
+
 func _unhandled_input(event: InputEvent) -> void:
 	if net_mode == NetMode.SERVER:
+		return
+	# Enter opens the chat input during a run (incl. the ESC pause). While typing,
+	# the focused LineEdit consumes Enter (text_submitted), so this only OPENS it.
+	var key_ev := event as InputEventKey
+	if key_ev != null and not chat_typing and key_ev.pressed and not key_ev.echo \
+			and (key_ev.keycode == KEY_ENTER or key_ev.keycode == KEY_KP_ENTER) \
+			and state == STATE_PLAYING:
+		_open_chat()
 		return
 	# ESC opens/closes the self-pause + server screen. (Spacebar no longer pauses.)
 	if event.is_action_pressed("pause"):
@@ -3464,10 +3588,13 @@ func _assemble_ship_body() -> void:
 
 func _update_player(delta: float) -> void:
 	var dir := Vector3.ZERO
-	if Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP):    dir.y += 1
-	if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN):  dir.y -= 1
-	if Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT):  dir.x -= 1
-	if Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT): dir.x += 1
+	# Suppress flight input while typing in chat — keys are polled from the
+	# hardware regardless of focus, so they must be gated explicitly.
+	if not chat_typing:
+		if Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP):    dir.y += 1
+		if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN):  dir.y -= 1
+		if Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT):  dir.x -= 1
+		if Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT): dir.x += 1
 	var input_active: float = clamp(dir.length(), 0.0, 1.0)
 	if dir.length_squared() > 0.0:
 		dir = dir.normalized()
@@ -3477,7 +3604,7 @@ func _update_player(delta: float) -> void:
 	# `boost_depleted` latches when the tank runs dry mid-boost so the player
 	# can't stutter-boost off the recharge by simply holding Shift; they must
 	# release and re-press once charge has built back up.
-	var shift_held: bool = Input.is_key_pressed(KEY_SHIFT)
+	var shift_held: bool = Input.is_key_pressed(KEY_SHIFT) and not chat_typing
 	if not shift_held:
 		boost_depleted = false
 	var want_boost: bool = shift_held and input_active > 0.0 and not boost_depleted
@@ -4301,6 +4428,17 @@ const DEFAULT_SHIP_DESIGN := {
 	"leds": "auto",
 }
 
+# ============================================================
+# Social — emote wheel (hold ALT) + chat (Enter). Both relay through the server
+# like designs: submit_* (client→server) → receive_* (server→all clients).
+# ============================================================
+const EMOTES := ["👍", "❤️", "😂", "😮", "😢", "😡", "🆘", "👋"]
+const EMOTE_DURATION := 5.0                 # seconds the billboard floats above the ship
+const EMOTE_OFFSET := Vector3(0, 1.3, 2.0)  # above + toward camera, in world units
+const CHAT_MAX_LINES := 8                   # messages shown in the log
+const CHAT_HISTORY := 30                    # messages kept
+const CHAT_MAX_LEN := 120
+
 func _make_proc_hull_mat(c: Color) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
 	m.albedo_color = c
@@ -4954,6 +5092,8 @@ func _make_gem_mesh() -> Node3D:
 # ============================================================
 
 func _update_fire(delta: float) -> void:
+	if chat_typing:
+		return   # no auto-fire while typing in chat
 	fire_timer -= delta
 	if fire_timer > 0.0:
 		return
@@ -6861,11 +7001,205 @@ func _rebuild_player_ship() -> void:
 		p_node.position = old_pos
 		p_node.rotation = old_rot
 
+# ============================================================
+# Social — emote wheel (hold ALT) + chat (Enter). Build, update, networking.
+# ============================================================
+func _load_emoji_font() -> void:
+	# Windows colour-emoji font so emotes render in colour. Missing file
+	# (non-Windows / odd install) → null, emotes fall back to the default font.
+	var path := "C:/Windows/Fonts/seguiemj.ttf"
+	if FileAccess.file_exists(path):
+		var f := FontFile.new()
+		if f.load_dynamic_font(path) == OK:
+			emoji_font = f
+
+func _build_social_ui() -> void:
+	# Chat (bottom-left) — added to `hud` AFTER the overlay panels so the input
+	# draws on top, including over the ESC pause screen.
+	chat_root = Control.new()
+	chat_root.size = Vector2(1280, 720)
+	chat_root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	chat_root.visible = false
+	hud.add_child(chat_root)
+
+	chat_log_label = Label.new()
+	chat_log_label.position = Vector2(18, 446)
+	chat_log_label.size = Vector2(444, 168)
+	chat_log_label.vertical_alignment = VERTICAL_ALIGNMENT_BOTTOM
+	chat_log_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	chat_log_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	chat_log_label.add_theme_font_size_override("font_size", 13)
+	chat_log_label.add_theme_color_override("font_color", COL_TEXT)
+	chat_log_label.modulate = Color(1, 1, 1, 0.85)
+	chat_root.add_child(chat_log_label)
+
+	chat_input = LineEdit.new()
+	chat_input.position = Vector2(18, 620)
+	chat_input.size = Vector2(444, 30)
+	chat_input.max_length = CHAT_MAX_LEN
+	chat_input.placeholder_text = "Nachricht … (Enter senden · Esc abbrechen)"
+	chat_input.visible = false
+	chat_input.add_theme_font_size_override("font_size", 14)
+	chat_input.text_submitted.connect(_on_chat_submitted)
+	chat_root.add_child(chat_input)
+
+	# Emote wheel (hidden until ALT is held).
+	var wheel := EmoteWheel.new()
+	wheel.size = Vector2(1280, 720)
+	wheel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	wheel.visible = false
+	hud.add_child(wheel)
+	wheel.setup(EMOTES, emoji_font)
+	emote_wheel = wheel
+
+func _update_social(delta: float) -> void:
+	_update_emotes(delta)
+	_update_emote_wheel()
+
+# ---- Emote wheel selection ----
+func _update_emote_wheel() -> void:
+	if emote_wheel == null:
+		return
+	var allowed: bool = state == STATE_PLAYING and not menu_open and not chat_typing and net_mode != NetMode.SERVER
+	var alt: bool = allowed and Input.is_key_pressed(KEY_ALT)
+	if alt and not emote_wheel_open:
+		emote_wheel_open = true
+		emote_wheel.set_hovered(-1)
+		emote_wheel.visible = true
+	elif emote_wheel_open and not alt:
+		var chosen: int = emote_wheel.hovered
+		emote_wheel_open = false
+		emote_wheel.visible = false
+		if chosen >= 0:
+			_fire_emote(chosen)
+	if emote_wheel_open:
+		var v: Vector2 = emote_wheel.get_local_mouse_position() - emote_wheel.wheel_center
+		if v.length() < 48.0:
+			emote_wheel.set_hovered(-1)   # centre deadzone = cancel
+		else:
+			var step: float = TAU / float(emote_wheel.seg_count)
+			var rel: float = fposmod(atan2(v.y, v.x) + PI / 2.0, TAU)
+			emote_wheel.set_hovered(int(round(rel / step)) % emote_wheel.seg_count)
+
+func _fire_emote(idx: int) -> void:
+	idx = clampi(idx, 0, EMOTES.size() - 1)
+	if net_mode == NetMode.CLIENT and net_connected:
+		submit_emote.rpc_id(1, idx)   # server echoes to everyone, incl. us
+	else:
+		_show_emote_above(-1, idx)    # offline: show locally
+
+# ---- Emote billboards (Label3D floating above a ship) ----
+func _show_emote_above(id: int, idx: int) -> void:
+	if world == null:
+		return
+	idx = clampi(idx, 0, EMOTES.size() - 1)
+	# One emote per player at a time — replace any existing one.
+	for e in active_emotes:
+		if int(e.get("follow", -999)) == id:
+			if e["label"] != null:
+				e["label"].queue_free()
+			active_emotes.erase(e)
+			break
+	var lbl := Label3D.new()
+	lbl.text = str(EMOTES[idx])
+	if emoji_font != null:
+		lbl.font = emoji_font
+	lbl.font_size = 200
+	lbl.pixel_size = 0.006
+	lbl.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	lbl.no_depth_test = true
+	lbl.fixed_size = false
+	lbl.render_priority = 10
+	lbl.outline_size = 26
+	lbl.outline_modulate = Color(0, 0, 0, 0.85)
+	world.add_child(lbl)
+	lbl.position = _emote_follow_pos(id) + EMOTE_OFFSET
+	active_emotes.append({"label": lbl, "follow": id, "timer": EMOTE_DURATION})
+
+func _emote_follow_pos(id: int) -> Vector3:
+	if id == -1:
+		return p_pos
+	if net_mode == NetMode.CLIENT and id == multiplayer.get_unique_id():
+		return p_pos
+	if remote_players.has(id):
+		var node = remote_players[id].get("node")
+		if node != null:
+			return node.position
+	return p_pos
+
+func _update_emotes(delta: float) -> void:
+	if active_emotes.is_empty():
+		return
+	var keep: Array = []
+	for e in active_emotes:
+		e["timer"] = float(e["timer"]) - delta
+		if e["timer"] <= 0.0 or e["label"] == null:
+			if e["label"] != null:
+				e["label"].queue_free()
+			continue
+		e["label"].position = _emote_follow_pos(int(e["follow"])) + EMOTE_OFFSET
+		keep.append(e)
+	active_emotes = keep
+
+func _clear_emotes() -> void:
+	for e in active_emotes:
+		if e["label"] != null:
+			e["label"].queue_free()
+	active_emotes.clear()
+	emote_wheel_open = false
+	if emote_wheel != null:
+		emote_wheel.visible = false
+
+# ---- Chat ----
+func _open_chat() -> void:
+	if chat_input == null or chat_typing:
+		return
+	chat_typing = true
+	chat_root.visible = true
+	chat_root.move_to_front()   # draw above the ESC pause panel
+	chat_input.visible = true
+	chat_input.text = ""
+	chat_input.grab_focus()
+
+func _close_chat() -> void:
+	if chat_input == null:
+		return
+	chat_input.visible = false
+	chat_input.release_focus()
+	chat_typing = false
+
+func _on_chat_submitted(text: String) -> void:
+	_send_chat(text)
+	_close_chat()
+
+func _send_chat(text: String) -> void:
+	var clean := text.strip_edges()
+	if clean.length() > CHAT_MAX_LEN:
+		clean = clean.substr(0, CHAT_MAX_LEN)
+	if clean.is_empty():
+		return
+	if net_mode == NetMode.CLIENT and net_connected:
+		submit_chat.rpc_id(1, clean)   # server echoes to everyone, incl. us
+	else:
+		_append_chat("%s: %s" % [player_name, clean])
+
+func _append_chat(line: String) -> void:
+	chat_messages.append(line)
+	if chat_messages.size() > CHAT_HISTORY:
+		chat_messages = chat_messages.slice(chat_messages.size() - CHAT_HISTORY)
+	if chat_log_label != null:
+		var start: int = maxi(0, chat_messages.size() - CHAT_MAX_LINES)
+		chat_log_label.text = "\n".join(chat_messages.slice(start))
+
 # Switch to the home screen: hide the gameplay HUD + any overlay, show the menu,
 # refresh its content and kick off a fresh server reachability probe.
 func _show_home() -> void:
 	state = STATE_HOME
 	menu_open = false
+	_close_chat()
+	_clear_emotes()
+	if chat_root != null:
+		chat_root.visible = false
 	if hud_game != null:
 		hud_game.visible = false
 	if levelup_panel != null:
@@ -6969,6 +7303,7 @@ func _coop_clear_world() -> void:
 			rp["node"].queue_free()
 	remote_players.clear()
 	cl_designs.clear()
+	_clear_emotes()
 	enemies.clear()
 	p_bullets.clear()
 	e_bullets.clear()
@@ -6984,6 +7319,8 @@ func _begin_play_common() -> void:
 		home_panel.visible = false
 	if hud_game != null:
 		hud_game.visible = true
+	if chat_root != null:
+		chat_root.visible = true
 	home_ship_spin = 0.0
 	if p_node != null:
 		p_node.rotation.z = 0.0
