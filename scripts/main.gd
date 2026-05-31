@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.9"
+const GAME_VERSION := "0.3.10"
 
 
 # Arena (in world units)
@@ -53,13 +53,20 @@ const BOSS_MIN_LEVEL := 5
 
 # Enemy power scaling — enemies compound with the triggering player's LEVEL (the best
 # proxy for player DPS, which grows fast via damage/projectile/fire-rate upgrades), on
-# top of the gentler per-wave ramp. Without this, late-game foes melt in one salvo.
-const ENEMY_HP_LEVEL_GROWTH := 1.16   # +16% enemy HP per player level (compounding)
-const ENEMY_DMG_LEVEL_GROWTH := 1.05  # +5% enemy damage per player level (so big foes still bite)
+# top of the gentler per-wave ramp. Without this, late-game foes melt in one salvo; tuned
+# down from the first pass (1.16/1.05) which made late-game too brutal.
+const ENEMY_HP_LEVEL_GROWTH := 1.10   # +10% enemy HP per player level (compounding)
+const ENEMY_DMG_LEVEL_GROWTH := 1.03  # +3% enemy damage per player level (so big foes still bite)
 
 # Heart-boss milestone: every Nth player level (5/10/15…) spawns a boss scaled to the
 # player; killing it drops a glowing red heart that heals the picker to full HP.
 const HEART_BOSS_EVERY_LEVELS := 5
+
+# On a co-op restart the player resets to level 1 but the server-owned swarm that killed
+# them is still alive at the death spot — scaled to their old (high) level. It also hogs
+# the global MAX_ENEMIES cap, starving spawns at the fresh respawn point. So reset_my_run
+# clears non-event wave enemies + gems within this radius of the death spot.
+const RESTART_CLEAR_RADIUS := 260.0
 
 # States
 const STATE_PLAYING := 0
@@ -1160,6 +1167,21 @@ func reset_my_run() -> void:
 	net_states[sender]["spawn_timer"] = 1.5
 	net_states[sender]["kills"] = 0
 	net_states[sender]["heart_ms"] = 0   # so level 5/10/… milestone bosses re-trigger after a restart
+	# Clear the swarm that killed us (still scaled to our old level) near the death spot.
+	# This RPC arrives before the client's new far-away position is reported, so
+	# net_states[sender].pos is still the death spot. Without this the leftover swarm hogs
+	# the global MAX_ENEMIES cap → nothing spawns at the fresh respawn point, and we'd have
+	# to fly back into the very swarm that killed us. Event entities are left alone.
+	var dpos: Vector3 = net_states[sender].get("pos", Vector3.ZERO)
+	for e in enemies:
+		if e.dead or e.is_mega or e.marked:
+			continue
+		if e.pos.distance_to(dpos) <= RESTART_CLEAR_RADIUS:
+			e.dead = true
+			despawn_enemy.rpc(e.net_id)
+	for g in gems:
+		if not g.dead and g.pos.distance_to(dpos) <= RESTART_CLEAR_RADIUS:
+			g.dead = true   # removed from the snapshot next tick → clients drop it
 
 # A client fired: the server creates the authoritative bullets (using the stats
 # the client reported — trusting clients is fine for friendly co-op).
