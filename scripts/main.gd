@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.8"
+const GAME_VERSION := "0.3.9"
 
 
 # Arena (in world units)
@@ -23,6 +23,7 @@ const P_RADIUS := 0.55
 const P_FIRE_RATE := 0.55
 const P_RANGE := 18.0
 const P_PICKUP_RANGE := 4.0
+const HEART_PICKUP_RANGE := 6.0   # full-heal hearts have a generous magnet so they're never missed
 const P_INVULN := 0.6
 
 # Projectile
@@ -49,6 +50,16 @@ const BOSS_EVERY := 5
 const SHOOTER_MIN_LEVEL := 2
 const TANK_MIN_LEVEL := 4
 const BOSS_MIN_LEVEL := 5
+
+# Enemy power scaling — enemies compound with the triggering player's LEVEL (the best
+# proxy for player DPS, which grows fast via damage/projectile/fire-rate upgrades), on
+# top of the gentler per-wave ramp. Without this, late-game foes melt in one salvo.
+const ENEMY_HP_LEVEL_GROWTH := 1.16   # +16% enemy HP per player level (compounding)
+const ENEMY_DMG_LEVEL_GROWTH := 1.05  # +5% enemy damage per player level (so big foes still bite)
+
+# Heart-boss milestone: every Nth player level (5/10/15…) spawns a boss scaled to the
+# player; killing it drops a glowing red heart that heals the picker to full HP.
+const HEART_BOSS_EVERY_LEVELS := 5
 
 # States
 const STATE_PLAYING := 0
@@ -102,6 +113,7 @@ class Entity:
 	var dna: Dictionary = {}  # enemy: procedural recipe, sent to clients so they rebuild the mesh
 	var owner_id: int = 0     # player bullet: peer id of the player who fired it
 	var tpos: Vector3 = Vector3.ZERO  # client: target position from the latest snapshot (lerp toward)
+	var drops_heart: bool = false # enemy: on death drops a full-heal heart (level-milestone boss)
 
 # Radar mini-map — bottom-right HUD overlay. Sci-fi style with a rotating
 # sweep beam that brightens contacts as it passes over them, soft glow halos
@@ -454,6 +466,7 @@ var enemies: Array = []
 var p_bullets: Array = []
 var e_bullets: Array = []
 var gems: Array = []
+var hearts: Array = []                # full-heal heart pickups (level-milestone boss drops)
 
 # Wave / spawn
 var wave: int = 1
@@ -461,6 +474,8 @@ var wave_timer: float = WAVE_DURATION
 var spawn_timer: float = 1.5
 var spawn_interval: float = 1.5
 var fire_timer: float = 0.0
+var pending_levelups: int = 0         # banked level-ups waiting to be picked one at a time
+                                      # (fast multi-level jumps queue instead of flashing past)
 
 # Camera / shake
 var cam: Camera3D
@@ -563,6 +578,7 @@ var cl_enemies := {}
 var cl_pbullets := {}
 var cl_ebullets := {}
 var cl_gems := {}
+var cl_hearts := {}                   # client: net_id -> heart Entity (mirrored from snapshot)
 var cl_designs := {}                  # client: id -> ship_design of each remote player (built into their mesh)
 var cl_upgrades := {}                 # client: id -> upgrade pick-counts of each remote player (visual growth)
 var up_counts: Dictionary = {}        # local: how many times each upgrade id was picked this run (synced)
@@ -731,7 +747,8 @@ func _on_peer_connected(id: int) -> void:
 	# wave 100+ because the dedicated server simulates 24/7).
 	net_states[id] = {"pos": Vector3.ZERO, "yaw": 0.0, "invuln": 0.0, "busy": false,
 		"level": 1, "name": "Pilot", "wave": 1, "wave_timer": WAVE_DURATION,
-		"spawn_timer": 1.5, "kills": 0, "design": DEFAULT_SHIP_DESIGN.duplicate(), "upgrades": {}}
+		"spawn_timer": 1.5, "kills": 0, "heart_ms": 0,
+		"design": DEFAULT_SHIP_DESIGN.duplicate(), "upgrades": {}}
 	print("[MP] Spieler verbunden: %d  (online: %d)" % [id, net_states.size()])
 	_broadcast_roster()
 
@@ -744,6 +761,7 @@ func _on_peer_disconnected(id: int) -> void:
 		p_bullets.clear()
 		e_bullets.clear()
 		gems.clear()
+		hearts.clear()
 		_reset_events()
 	print("[MP] Spieler getrennt: %d  (online: %d)" % [id, net_states.size()])
 	_broadcast_roster()
@@ -773,6 +791,7 @@ func _server_sim(delta: float) -> void:
 	_server_update_bullets(p_bullets, delta)
 	_server_update_bullets(e_bullets, delta)
 	_server_update_gems(delta)
+	_server_update_hearts(delta)
 	_server_update_spawning(delta)
 	_server_update_waves(delta)
 	_update_events(delta)
@@ -852,6 +871,34 @@ func _server_update_gems(delta: float) -> void:
 			g.dead = true
 			grant_xp.rpc_id(np_id, g.value)
 
+# Hearts magnet toward the nearest player and are removed on touch. Healing itself is
+# client-owned, so the server only drives position + despawn — the nearest client heals
+# itself locally when its ship reaches the heart (it uses a slightly larger catch radius
+# than this despawn radius so it never misses the heart the server just removed).
+func _server_update_hearts(delta: float) -> void:
+	for h in hearts:
+		if h.dead:
+			continue
+		var np_id: int = -1
+		var nd: float = INF
+		var npp: Vector3 = Vector3.ZERO
+		for id in net_states:
+			var pp: Vector3 = net_states[id]["pos"]
+			var d: float = pp.distance_to(h.pos)
+			if d < nd:
+				nd = d
+				np_id = id
+				npp = pp
+		if np_id == -1:
+			continue
+		if nd <= HEART_PICKUP_RANGE:
+			h.vel = h.vel.lerp((npp - h.pos).normalized() * 18.0, clamp(delta * 6.0, 0.0, 1.0))
+		else:
+			h.vel = h.vel.lerp(Vector3.ZERO, clamp(delta * 3.0, 0.0, 1.0))
+		h.pos += h.vel * delta
+		if nd <= P_RADIUS + h.radius:
+			h.dead = true
+
 # Per-player spawning: every non-busy player gets their OWN stream of enemies in
 # their OWN area, scaled to THEIR wave + level. When two players are close their
 # streams overlap, so both wave levels spawn around them at the same time. Busy
@@ -873,7 +920,8 @@ func _server_update_spawning(delta: float) -> void:
 		var center: Vector3 = st["pos"]
 		var ang: float = randf() * TAU
 		var pos: Vector3 = center + Vector3(cos(ang), sin(ang), 0) * SPAWN_RING
-		_spawn_enemy(_pick_enemy_kind(int(st.get("level", 1))), pos, pw)
+		var lvl: int = int(st.get("level", 1))
+		_spawn_enemy(_pick_enemy_kind(lvl), pos, pw, false, lvl)
 
 # Per-player wave progression: each player's wave advances on its own timer, and
 # their boss waves trigger in their own area — independent of every other player.
@@ -898,7 +946,21 @@ func _spawn_boss_for(id: int) -> void:
 	var st: Dictionary = net_states[id]
 	var center: Vector3 = st["pos"]
 	var ang: float = randf() * TAU
-	_spawn_enemy("boss", center + Vector3(cos(ang), sin(ang), 0) * (SPAWN_RING * 0.6), int(st.get("wave", 1)))
+	_spawn_enemy("boss", center + Vector3(cos(ang), sin(ang), 0) * (SPAWN_RING * 0.6), int(st.get("wave", 1)), false, int(st.get("level", 1)))
+
+# A milestone heart-boss for one player (every HEART_BOSS_EVERY_LEVELS levels). Scaled to
+# that player's wave + level; flagged so its death drops a full-heal heart. The triggering
+# player gets a targeted banner so they know to hunt it.
+func _spawn_heart_boss_for(id: int) -> void:
+	if not net_states.has(id) or _alive_enemy_count() >= MAX_ENEMIES:
+		return
+	var st: Dictionary = net_states[id]
+	var center: Vector3 = st["pos"]
+	var ang: float = randf() * TAU
+	var lvl: int = int(st.get("level", 1))
+	var b: Entity = _spawn_enemy("boss", center + Vector3(cos(ang), sin(ang), 0) * (SPAWN_RING * 0.75), int(st.get("wave", 1)), false, lvl)
+	b.drops_heart = true
+	announce_event.rpc_id(id, "❤ HERZ-BOSS — besiege ihn für volle Heilung!")
 
 func _server_resolve_collisions() -> void:
 	# Player bullets vs enemies.
@@ -1004,10 +1066,18 @@ func _server_broadcast() -> void:
 		if not g.dead:
 			gid.append(g.net_id)
 			gpos.append(Vector2(g.pos.x, g.pos.y))
+	# Hearts are rare (one per milestone boss) → a handful of entries at most, no MTU risk.
+	var hid := PackedInt32Array()
+	var hpos := PackedVector2Array()
+	for h in hearts:
+		if not h.dead:
+			hid.append(h.net_id)
+			hpos.append(Vector2(h.pos.x, h.pos.y))
 	receive_world.rpc({
 		"pid": pid, "ppos": ppos, "pyaw": pyaw, "pwave": pwave, "pkills": pkills,
 		"eid": eid, "epos": epos,
 		"gid": gid, "gpos": gpos,
+		"hid": hid, "hpos": hpos,
 	})
 	# Bullets are by far the bulk of the snapshot (rapid fire + multi-projectile +
 	# enemy fire), so they go in their own unreliable packet — they never share an
@@ -1043,11 +1113,22 @@ func submit_player_state(pos: Vector3, yaw: float, level: int) -> void:
 		return
 	var sender := multiplayer.get_remote_sender_id()
 	if not net_states.has(sender):
-		net_states[sender] = {"pos": pos, "yaw": yaw, "invuln": 0.0, "busy": false, "level": level}
+		net_states[sender] = {"pos": pos, "yaw": yaw, "invuln": 0.0, "busy": false, "level": level, "heart_ms": 0}
 	else:
 		net_states[sender]["pos"] = pos
 		net_states[sender]["yaw"] = yaw
 		net_states[sender]["level"] = level
+	# Heart-boss milestone: each time the client crosses a multiple of HEART_BOSS_EVERY_LEVELS,
+	# spawn a boss in its area that drops a full-heal heart. Detected from the level report,
+	# so no extra RPC is needed (non-breaking).
+	var ms: int = level / HEART_BOSS_EVERY_LEVELS
+	var prev_ms: int = int(net_states[sender].get("heart_ms", 0))
+	if level >= HEART_BOSS_EVERY_LEVELS and ms > prev_ms:
+		net_states[sender]["heart_ms"] = ms
+		# Spawn one heart-boss per crossed milestone (normally just one; a big XP jump
+		# across several is rare but honours every 5-level step).
+		for _i in range(ms - prev_ms):
+			_spawn_heart_boss_for(sender)
 
 # A client opens/closes its level-up menu. The shared world can't pause for one
 # player, so instead the server marks them busy → immune to damage while choosing,
@@ -1078,6 +1159,7 @@ func reset_my_run() -> void:
 	net_states[sender]["wave_timer"] = WAVE_DURATION
 	net_states[sender]["spawn_timer"] = 1.5
 	net_states[sender]["kills"] = 0
+	net_states[sender]["heart_ms"] = 0   # so level 5/10/… milestone bosses re-trigger after a restart
 
 # A client fired: the server creates the authoritative bullets (using the stats
 # the client reported — trusting clients is fine for friendly co-op).
@@ -1536,6 +1618,7 @@ func receive_world(snap: Dictionary) -> void:
 	_apply_players(snap.get("pid", PackedInt32Array()), snap.get("ppos", PackedVector2Array()), snap.get("pyaw", PackedFloat32Array()), snap.get("pwave", PackedInt32Array()), snap.get("pkills", PackedInt32Array()))
 	_apply_enemy_positions(snap.get("eid", PackedInt32Array()), snap.get("epos", PackedVector2Array()))
 	_apply_gems(snap.get("gid", PackedInt32Array()), snap.get("gpos", PackedVector2Array()))
+	_apply_hearts(snap.get("hid", PackedInt32Array()), snap.get("hpos", PackedVector2Array()))
 
 # Bullets stream in their own unreliable packet (see _server_broadcast).
 @rpc("authority", "call_remote", "unreliable")
@@ -1642,6 +1725,36 @@ func _apply_gems(ids: PackedInt32Array, posv: PackedVector2Array) -> void:
 			cl_gems.erase(net_id)
 			gems.erase(g)
 
+# Client mirror of the server's hearts (full-heal pickups). Built/removed from the
+# snapshot exactly like gems; the actual heal happens in _client_net_update on touch.
+func _apply_hearts(ids: PackedInt32Array, posv: PackedVector2Array) -> void:
+	var seen := {}
+	for i in ids.size():
+		var net_id: int = ids[i]
+		seen[net_id] = true
+		var pos: Vector3 = Vector3(posv[i].x, posv[i].y, 0)
+		if cl_hearts.has(net_id):
+			cl_hearts[net_id].tpos = pos
+		else:
+			var h := Entity.new()
+			h.type = "heart"
+			h.net_id = net_id
+			h.pos = pos
+			h.tpos = pos
+			h.radius = 0.6
+			h.node = _make_heart_mesh()
+			h.node.position = pos
+			world.add_child(h.node)
+			cl_hearts[net_id] = h
+			hearts.append(h)
+	for net_id in cl_hearts.keys():
+		if not seen.has(net_id):
+			var h: Entity = cl_hearts[net_id]
+			if h.node != null:
+				h.node.queue_free()
+			cl_hearts.erase(net_id)
+			hearts.erase(h)
+
 # Per-frame client networking: send my transform, then smoothly interpolate every
 # remote thing toward its latest snapshot value.
 func _client_net_update(delta: float) -> void:
@@ -1684,6 +1797,26 @@ func _client_net_update(delta: float) -> void:
 			g.node.rotation.z = g.pulse * 4.0
 			var s: float = 0.9 + sin(g.pulse * 6.0) * 0.12
 			g.node.scale = Vector3(s, s, s)
+	# Hearts — lerp toward the server position; heal to full when our own ship reaches one.
+	# Heal radius is a touch larger than the server's despawn radius so we never miss the
+	# heart the server is about to remove. Once collected we mark it dead (not erase) so the
+	# still-arriving snapshot can't recreate it; _apply_hearts clears it once the server drops it.
+	for net_id in cl_hearts:
+		var h: Entity = cl_hearts[net_id]
+		if h.dead:
+			continue
+		h.pos = h.pos.lerp(h.tpos, clamp(delta * 12.0, 0.0, 1.0))
+		h.pulse += delta
+		if h.node != null:
+			h.node.position = h.pos + Vector3(0, 0, sin(h.pulse * 2.0) * 0.2)
+			var hs: float = 1.0 + sin(h.pulse * 5.0) * 0.12
+			h.node.scale = Vector3(hs, hs, hs)
+		if not (menu_open or state == STATE_LEVELUP) and p_pos.distance_to(h.pos) <= P_RADIUS + h.radius + 1.0:
+			_collect_heart()
+			h.dead = true
+			if h.node != null:
+				h.node.queue_free()
+				h.node = null
 
 # Standalone copy of the player ship for a remote co-op player. Reuses the exact
 # geometry of _assemble_ship_body() by temporarily redirecting the member vars it
@@ -2179,6 +2312,7 @@ func _process(delta: float) -> void:
 		_update_p_bullets(delta)
 		_update_e_bullets(delta)
 		_update_gems(delta)
+		_update_hearts(delta)
 		_update_fire(delta)
 		_update_spawning(delta)
 		_update_wave(delta)
@@ -4045,6 +4179,35 @@ func _update_gems(delta: float) -> void:
 			g.dead = true
 			_check_level_up()
 
+# Full-heal hearts (single-player + co-op server render): magnet toward the player, heal
+# to full on touch. Pulses + bobs so it reads as a glowing, alive pickup.
+func _update_hearts(delta: float) -> void:
+	for h in hearts:
+		if h.dead:
+			continue
+		h.pulse += delta
+		var to_p: Vector3 = p_pos - h.pos
+		var d: float = to_p.length()
+		if d <= HEART_PICKUP_RANGE:
+			h.vel = h.vel.lerp(to_p.normalized() * 18.0, clamp(delta * 6.0, 0.0, 1.0))
+		else:
+			h.vel = h.vel.lerp(Vector3.ZERO, clamp(delta * 3.0, 0.0, 1.0))
+		h.pos += h.vel * delta
+		if h.node != null:
+			h.node.position = h.pos + Vector3(0, 0, sin(h.pulse * 2.0) * 0.2)
+			var s: float = 1.0 + sin(h.pulse * 5.0) * 0.12
+			h.node.scale = Vector3(s, s, s)
+		if d <= P_RADIUS + h.radius:
+			h.dead = true
+			_collect_heart()
+
+# Heal the local player to full and flash feedback. HP is client-owned, so co-op clients
+# call this directly on touch (the server just removes the heart entity).
+func _collect_heart() -> void:
+	p_hp = p_max_hp
+	_camera_shake(0.25, 0.18)
+	_show_announce("❤ VOLLE HEILUNG!")
+
 func _out_of_arena(p: Vector3) -> bool:
 	# Bullets despawn when they get too far from the player (open-space)
 	return p.distance_to(p_pos) > 35.0
@@ -4099,13 +4262,19 @@ func _ring_pos(radius: float) -> Vector3:
 	var ang: float = randf() * TAU
 	return p_pos + Vector3(cos(ang), sin(ang), 0) * radius
 
-func _spawn_enemy(kind: String, pos: Vector3, wave_n: int = -1, mega: bool = false) -> Entity:
+func _spawn_enemy(kind: String, pos: Vector3, wave_n: int = -1, mega: bool = false, lvl: int = -1) -> Entity:
 	var e := Entity.new()
 	e.type = kind
 	e.pos = pos
 	# Per-player wave on the server (passed in), global wave in single-player.
 	var wn: int = wave_n if wave_n >= 0 else wave
+	# Scale to the triggering player's LEVEL (their DPS proxy) on top of the per-wave ramp,
+	# so late-game enemies — especially the big ones — don't get blasted away instantly.
+	var lv: int = lvl if lvl >= 1 else maxi(1, _party_level())
 	var wave_scale: float = 1.0 + (wn - 1) * 0.18
+	var level_scale: float = pow(ENEMY_HP_LEVEL_GROWTH, lv - 1)
+	var hp_scale: float = wave_scale * level_scale
+	var dmg_scale: float = pow(ENEMY_DMG_LEVEL_GROWTH, lv - 1)
 	# Generate procedural DNA — gives variety even within same role
 	var dna := _generate_enemy_dna(kind, wn)
 	var size: float = dna["size_mult"]
@@ -4117,18 +4286,18 @@ func _spawn_enemy(kind: String, pos: Vector3, wave_n: int = -1, mega: bool = fal
 		size = dna["size_mult"]
 	match kind:
 		"drone":
-			e.hp = int(round(2 * wave_scale)); e.max_hp = e.hp
-			e.radius = 0.45 * size / 0.55; e.damage = 10; e.value = 1
+			e.hp = int(round(2 * hp_scale)); e.max_hp = e.hp
+			e.radius = 0.45 * size / 0.55; e.damage = int(round(10 * dmg_scale)); e.value = 1
 		"shooter":
-			e.hp = int(round(5 * wave_scale)); e.max_hp = e.hp
-			e.radius = 0.55 * size / 0.65; e.damage = 8; e.value = 3
+			e.hp = int(round(5 * hp_scale)); e.max_hp = e.hp
+			e.radius = 0.55 * size / 0.65; e.damage = int(round(8 * dmg_scale)); e.value = 3
 			e.shoot_cd = 1.8; e.shoot_timer = 1.2
 		"tank":
-			e.hp = int(round(20 * wave_scale)); e.max_hp = e.hp
-			e.radius = 0.95 * size / 1.05; e.damage = 22; e.value = 8
+			e.hp = int(round(20 * hp_scale)); e.max_hp = e.hp
+			e.radius = 0.95 * size / 1.05; e.damage = int(round(22 * dmg_scale)); e.value = 8
 		"boss":
-			e.hp = int(round(150 + wn * 25)); e.max_hp = e.hp
-			e.radius = 1.5 * size / 1.7; e.damage = 25; e.value = 50
+			e.hp = int(round((150 + wn * 25) * level_scale)); e.max_hp = e.hp
+			e.radius = 1.5 * size / 1.7; e.damage = int(round(25 * dmg_scale)); e.value = 50
 			e.shoot_cd = 1.0; e.shoot_timer = 1.0
 	# Mega-boss stat overrides (radius already 5x via the scaled size above).
 	if mega:
@@ -4229,22 +4398,22 @@ func _update_events(delta: float) -> void:
 		pool.erase(last_event_kind)
 	match pool[randi() % pool.size()]:
 		"escort":
-			_start_escort(center, wn)
+			_start_escort(center, wn, lvl)
 		"parkour":
 			_start_parkour(center, wn)
 		"mega":
-			_start_mega(center, wn)
+			_start_mega(center, wn, lvl)
 
-func _start_mega(center: Vector3, wn: int) -> void:
+func _start_mega(center: Vector3, wn: int, lvl: int) -> void:
 	var ang: float = randf() * TAU
 	var pos: Vector3 = center + Vector3(cos(ang), sin(ang), 0) * randf_range(MEGA_SPAWN_MIN, MEGA_SPAWN_MAX)
-	mega_active = _spawn_enemy("boss", pos, wn, true)
+	mega_active = _spawn_enemy("boss", pos, wn, true, lvl)
 	active_event = "mega"
 	last_event_kind = "mega"
 	_event_announce("⚠ ANOMALIE GEORTET — ein gewaltiger Gegner lauert. Folge dem Radar!")
 
 # A friendly pilot pinned down by marked shooters — escort/rescue event.
-func _start_escort(center: Vector3, wn: int) -> void:
+func _start_escort(center: Vector3, wn: int, lvl: int) -> void:
 	var ang: float = randf() * TAU
 	escort_pos = center + Vector3(cos(ang), sin(ang), 0) * randf_range(ESCORT_SPAWN_MIN, ESCORT_SPAWN_MAX)
 	escort_bot = _spawn_friendly(escort_pos, ESCORT_BOT_HP)
@@ -4252,7 +4421,7 @@ func _start_escort(center: Vector3, wn: int) -> void:
 	for i in ESCORT_MARKERS:
 		var ma: float = float(i) / float(ESCORT_MARKERS) * TAU + randf_range(-0.3, 0.3)
 		var mp: Vector3 = escort_pos + Vector3(cos(ma), sin(ma), 0) * randf_range(5.0, 10.0)
-		var me := _spawn_enemy("shooter", mp, wn)
+		var me := _spawn_enemy("shooter", mp, wn, false, lvl)
 		me.marked = true
 		escort_markers.append(me)
 	escort_timer = ESCORT_TIME
@@ -5846,6 +6015,60 @@ func _make_gem_mesh() -> Node3D:
 	root.add_child(l)
 	return root
 
+# Spawn a full-heal heart pickup at pos. On the headless server it's id-only (synced via
+# the snapshot's hid/hpos); everywhere else it gets the glowing red heart mesh.
+func _spawn_heart(pos: Vector3) -> void:
+	var h := Entity.new()
+	h.type = "heart"
+	h.pos = pos
+	h.vel = Vector3(randf_range(-2, 2), randf_range(-2, 2), 0)
+	h.radius = 0.6
+	if net_mode == NetMode.SERVER:
+		h.net_id = _next_net_id()
+		hearts.append(h)
+		return
+	h.node = _make_heart_mesh()
+	h.node.position = pos
+	world.add_child(h.node)
+	hearts.append(h)
+
+# A glowing red heart: two sphere lobes up top + a 45°-rotated box for the point below,
+# all emissive red, lit by a bright red OmniLight so it's unmistakable on the battlefield.
+# Built in the XY play plane (lobes toward +Y read as "up" under the tilted camera).
+func _make_heart_mesh() -> Node3D:
+	var root := Node3D.new()
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(1.0, 0.12, 0.22)
+	mat.emission_enabled = true
+	mat.emission = Color(1.0, 0.1, 0.28)
+	mat.emission_energy_multiplier = 5.0
+	mat.metallic = 0.25
+	mat.roughness = 0.3
+	for sx in [-1.0, 1.0]:
+		var lobe := MeshInstance3D.new()
+		var sm := SphereMesh.new()
+		sm.radius = 0.42
+		sm.height = 0.84
+		sm.material = mat
+		lobe.mesh = sm
+		lobe.position = Vector3(0.3 * sx, 0.26, 0)
+		root.add_child(lobe)
+	var pt := MeshInstance3D.new()
+	var bm := BoxMesh.new()
+	bm.size = Vector3(0.86, 0.86, 0.55)
+	bm.material = mat
+	pt.mesh = bm
+	pt.position = Vector3(0, -0.2, 0)
+	pt.rotation_degrees = Vector3(0, 0, 45)
+	root.add_child(pt)
+	var l := OmniLight3D.new()
+	l.light_color = Color(1.0, 0.2, 0.28)
+	l.light_energy = 3.2
+	l.omni_range = 6.5
+	l.omni_attenuation = 1.4
+	root.add_child(l)
+	return root
+
 # ============================================================
 # Auto-fire
 # ============================================================
@@ -6005,6 +6228,9 @@ func _kill_enemy(e: Entity, killer_id: int = -1) -> void:
 		_event_announce("💥 MEGA-BOSS BESIEGT — riesige Beute!")
 	for i in gem_count:
 		_spawn_gem(e.pos + Vector3(randf_range(-0.4, 0.4), randf_range(-0.4, 0.4), 0), e.value)
+	# Milestone heart-boss → drop a glowing full-heal heart right where it died.
+	if e.drops_heart:
+		_spawn_heart(e.pos)
 	if net_mode == NetMode.SERVER:
 		despawn_enemy.rpc(e.net_id)
 		return
@@ -6157,11 +6383,31 @@ func _xp_for_next() -> int:
 	return XP_BASE + (p_level - 1) * XP_INC + int(pow(p_level - 1, 1.5))
 
 func _check_level_up() -> void:
+	# Bank EVERY level we've earned, but only ever display one picker at a time. Fast
+	# multi-level jumps (e.g. a big gem shower) used to re-call _offer_levelup mid-frame,
+	# overwriting the panel so the player only got to pick the last one — now each banked
+	# level gets its own panel in turn (see _on_levelup_pick).
 	while p_xp >= _xp_for_next():
 		p_xp -= _xp_for_next()
 		p_level += 1
+		pending_levelups += 1
+		# Single-player milestone heart-boss (co-op: the server spawns it from the level
+		# report in submit_player_state, since enemies are server-owned).
+		if net_mode == NetMode.SINGLE and p_level % HEART_BOSS_EVERY_LEVELS == 0:
+			_spawn_heart_boss_local()
+	if pending_levelups > 0 and state != STATE_LEVELUP:
 		_offer_levelup()
+
+# Single-player milestone boss that drops a full-heal heart — spawned near the player,
+# scaled to its level (co-op uses _spawn_heart_boss_for on the server instead).
+func _spawn_heart_boss_local() -> void:
+	if enemies.size() >= MAX_ENEMIES:
 		return
+	var ang: float = randf() * TAU
+	var pos: Vector3 = p_pos + Vector3(cos(ang), sin(ang), 0) * (SPAWN_RING * 0.75 * u_range_mult)
+	var b: Entity = _spawn_enemy("boss", pos, wave, false, p_level)
+	b.drops_heart = true
+	_show_announce("❤ HERZ-BOSS erschienen — besiege ihn für volle Heilung!")
 
 func _offer_levelup() -> void:
 	state = STATE_LEVELUP
@@ -6581,6 +6827,12 @@ func _on_levelup_pick(idx: int) -> void:
 	# Track + sync the pick count so co-op partners see our ship grow the same parts.
 	up_counts[up["id"]] = int(up_counts.get(up["id"], 0)) + 1
 	_submit_upgrades()
+	pending_levelups = maxi(0, pending_levelups - 1)
+	# Still have banked level-ups? Show the next picker right away (stay in STATE_LEVELUP,
+	# keep busy/invuln) so a multi-level jump grants one pick per level instead of one total.
+	if pending_levelups > 0:
+		_offer_levelup()
+		return
 	levelup_panel.visible = false
 	state = STATE_PLAYING
 	# Resume server-side damage, but keep a short grace window so we're not instantly
@@ -6730,6 +6982,7 @@ func _reset_player_progression() -> void:
 	p_max_hp = P_HP
 	p_level = 1
 	p_xp = 0
+	pending_levelups = 0
 	fire_timer = 0.0
 	u_speed_mult = 1.0
 	u_fire_rate_mult = 1.0
@@ -6759,10 +7012,14 @@ func _restart_run() -> void:
 	for g in gems:
 		if g.node != null:
 			g.node.queue_free()
+	for h in hearts:
+		if h.node != null:
+			h.node.queue_free()
 	enemies.clear()
 	p_bullets.clear()
 	e_bullets.clear()
 	gems.clear()
+	hearts.clear()
 	_reset_events()
 	_reset_player_progression()
 	p_pos = Vector3.ZERO
@@ -6815,6 +7072,14 @@ func _purge_dead() -> void:
 		else:
 			keep_g.append(g)
 	gems = keep_g
+	var keep_h: Array = []
+	for h in hearts:
+		if h.dead:
+			if h.node != null:
+				h.node.queue_free()
+		else:
+			keep_h.append(h)
+	hearts = keep_h
 
 func _camera_shake(amount: float, dur: float) -> void:
 	shake_amount = max(shake_amount, amount)
@@ -8093,7 +8358,7 @@ func _home_probe_finish() -> void:
 # Frees every client-mirrored entity (enemies / bullets / gems / remote players)
 # and clears the parallel arrays. Used before joining co-op and after a probe.
 func _coop_clear_world() -> void:
-	for d in [cl_enemies, cl_pbullets, cl_ebullets, cl_gems]:
+	for d in [cl_enemies, cl_pbullets, cl_ebullets, cl_gems, cl_hearts]:
 		for k in d.keys():
 			var ent = d[k]
 			if ent != null and ent.node != null:
@@ -8118,6 +8383,7 @@ func _coop_clear_world() -> void:
 	p_bullets.clear()
 	e_bullets.clear()
 	gems.clear()
+	hearts.clear()
 
 # Shared setup when leaving the home screen for a run.
 func _begin_play_common() -> void:
