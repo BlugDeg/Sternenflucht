@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.11"
+const GAME_VERSION := "0.3.12"
 
 
 # Arena (in world units)
@@ -1795,9 +1795,15 @@ func _client_net_update(delta: float) -> void:
 	# Enemies — lerp toward snapshot position; keep e.pos current for aim/radar.
 	for net_id in cl_enemies:
 		var e: Entity = cl_enemies[net_id]
+		# No velocity is synced, so derive heading from where it's travelling (target − current)
+		# to yaw the ship into its flight direction, like the player + single-player enemies.
+		var heading: Vector3 = e.tpos - e.pos
 		e.pos = e.pos.lerp(e.tpos, clamp(delta * 12.0, 0.0, 1.0))
 		if e.node != null:
 			e.node.position = e.pos
+			if heading.length_squared() > 0.0004:
+				var want: float = atan2(heading.y, heading.x)
+				e.node.rotation.z = lerp_angle(e.node.rotation.z, want, clamp(delta * 6.0, 0.0, 1.0))
 	# Bullets — extrapolate by velocity between the 20 Hz snapshots so they glide.
 	for net_id in cl_pbullets:
 		var b: Entity = cl_pbullets[net_id]
@@ -4104,9 +4110,12 @@ func _update_enemies(delta: float) -> void:
 				e.node.scale = Vector3.ONE * (1.0 + e.hit_flash * 0.15)
 			else:
 				e.node.scale = Vector3.ONE
-			# Slow spin for boss
-			if e.type == "boss":
-				e.node.rotation.z += delta * 1.2
+			# Yaw to face the movement direction, exactly like the player ship (same
+			# airplane frame: nose = +X, body tilted 90° on X). Smooth turn so it banks
+			# naturally instead of flying sideways. Near-stationary enemies keep their facing.
+			if e.vel.length_squared() > 0.04:
+				var want: float = atan2(e.vel.y, e.vel.x)
+				e.node.rotation.z = lerp_angle(e.node.rotation.z, want, clamp(delta * 6.0, 0.0, 1.0))
 
 func _clamp_to_arena(e: Entity) -> void:
 	# Open space — enemies follow player, no hard arena boundaries
