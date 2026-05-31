@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.6"
+const GAME_VERSION := "0.3.7"
 
 
 # Arena (in world units)
@@ -344,6 +344,24 @@ class RadarPanel extends Control:
 				var perpf := Vector2(-dirf.y, dirf.x)
 				draw_polygon(PackedVector2Array([atf + dirf * 6.0, atf - dirf * 3.0 + perpf * 3.5, atf - dirf * 3.0 - perpf * 3.5]), PackedColorArray([Color(0.5, 1.0, 0.6, 0.9)]))
 
+		# Parkour: cyan marker / rim arrow pointing at the next ring to fly through.
+		if main.parkour_next < main.parkour_pts.size():
+			var dxyr: Vector3 = main.parkour_pts[main.parkour_next] - p_pos
+			var dr: float = dxyr.length()
+			if dr <= 240.0:
+				var pulsr: float = 0.5 + 0.5 * sin(t_accum * 5.0)
+				var rcol := Color(0.45, 0.95, 1.0)
+				if dr <= world_range:
+					var rp2 := Vector2(r + dxyr.x * scale_factor, r - dxyr.y * scale_factor)
+					draw_arc(rp2, 6.0 + pulsr * 3.0, 0.0, TAU, 24, Color(0.5, 0.95, 1.0, 0.85), 2.0)
+					_draw_blip(rp2, rcol, 3.4, 0.8 + pulsr)
+				else:
+					var dirr := Vector2(dxyr.x, -dxyr.y).normalized()
+					var at_ring := c + dirr * (r - 5.0)
+					_draw_blip(at_ring, rcol, 3.2, 0.5 + pulsr)
+					var perpr := Vector2(-dirr.y, dirr.x)
+					draw_polygon(PackedVector2Array([at_ring + dirr * 6.0, at_ring - dirr * 3.0 + perpr * 3.5, at_ring - dirr * 3.0 - perpr * 3.5]), PackedColorArray([Color(0.5, 0.95, 1.0, 0.9)]))
+
 		# Other players — always pinned to the rim with a directional arrow,
 		# regardless of distance, so the party can find each other.
 		for id in main.remote_players:
@@ -608,6 +626,13 @@ var escort_pos: Vector3 = Vector3.ZERO     # bot location (markers target this)
 var escort_obj_accum: float = 0.0          # throttle for the objective broadcast
 var friendlies: Array = []                 # Entity refs of friendly bots (server logic + render)
 var cl_friendlies: Dictionary = {}         # client: net_id -> friendly Entity
+# Ring parkour: pts + next index are authority logic AND mirrored on clients;
+# nodes are the ring visuals (client/single only).
+var parkour_pts: PackedVector3Array = PackedVector3Array()
+var parkour_next: int = 0
+var parkour_timer: float = 0.0
+var parkour_obj_accum: float = 0.0
+var parkour_nodes: Array = []              # ring Node3D visuals (empty on the server)
 var announce_label: Label = null           # transient centre-top HUD banner
 var announce_timer: float = 0.0
 var objective_label: Label = null          # persistent objective line during an event
@@ -1337,6 +1362,7 @@ func _on_server_disconnected() -> void:
 			f.node.queue_free()
 	friendlies.clear()
 	cl_friendlies.clear()
+	_clear_parkour_rings()
 	_apply_objective("")
 	net_roster.clear()
 	if menu_open:
@@ -4041,6 +4067,9 @@ func _update_events(delta: float) -> void:
 		"escort":
 			_update_escort(delta)
 			return
+		"parkour":
+			_update_parkour(delta)
+			return
 	# No active event → count down, then start a random eligible one.
 	event_timer -= delta
 	if event_timer > 0.0:
@@ -4066,14 +4095,20 @@ func _update_events(delta: float) -> void:
 		center = p_pos
 		lvl = p_level
 		wn = wave
-	# Alternate event types so neither dominates (the boss kept monopolising). The
-	# mega-boss needs a higher level; below it — and after any non-escort event,
-	# incl. the very first — run the escort. So: escort → mega → escort → …
-	var can_mega: bool = lvl >= MEGA_MIN_LEVEL
-	if not can_mega or last_event_kind != "escort":
-		_start_escort(center, wn)
-	else:
-		_start_mega(center, wn)
+	# Pick from the eligible event types, avoiding an immediate repeat so all three
+	# rotate (escort + parkour from level 4, mega from MEGA_MIN_LEVEL).
+	var pool: Array = ["escort", "parkour"]
+	if lvl >= MEGA_MIN_LEVEL:
+		pool.append("mega")
+	if pool.size() > 1 and last_event_kind in pool:
+		pool.erase(last_event_kind)
+	match pool[randi() % pool.size()]:
+		"escort":
+			_start_escort(center, wn)
+		"parkour":
+			_start_parkour(center, wn)
+		"mega":
+			_start_mega(center, wn)
 
 func _start_mega(center: Vector3, wn: int) -> void:
 	var ang: float = randf() * TAU
@@ -4140,11 +4175,59 @@ func _escort_finish(_success: bool) -> void:
 	escort_markers.clear()
 	_end_event()
 
+# Ring parkour: a winding chain of rings to fly through in order, against the clock.
+func _start_parkour(center: Vector3, _wn: int) -> void:
+	parkour_pts = PackedVector3Array()
+	var ang: float = randf() * TAU
+	var pos: Vector3 = center + Vector3(cos(ang), sin(ang), 0) * randf_range(PARKOUR_SPAWN_MIN, PARKOUR_SPAWN_MAX)
+	var dir: Vector3 = Vector3(cos(ang), sin(ang), 0)
+	for i in PARKOUR_RINGS:
+		parkour_pts.append(pos)
+		dir = dir.rotated(Vector3(0, 0, 1), randf_range(-PARKOUR_TURN, PARKOUR_TURN)).normalized()
+		pos += dir * PARKOUR_STEP
+	parkour_next = 0
+	parkour_timer = PARKOUR_TIME
+	parkour_obj_accum = 0.0
+	active_event = "parkour"
+	last_event_kind = "parkour"
+	if net_mode == NetMode.SERVER:
+		spawn_parkour.rpc(parkour_pts)
+	else:
+		_build_parkour_rings(parkour_pts)
+	_event_announce("🏁 KURS ENTDECKT — durchfliege alle Ringe der Reihe nach, bevor die Zeit abläuft!")
+
+func _update_parkour(delta: float) -> void:
+	parkour_timer -= delta
+	if parkour_timer <= 0.0:
+		_event_announce("⏱ Zeit abgelaufen — Kurs gescheitert.")
+		_end_event()
+		return
+	if parkour_next < parkour_pts.size():
+		var target: Vector3 = parkour_pts[parkour_next]
+		# Any player flying through the next ring advances the course (shared).
+		if _min_player_dist(target) <= PARKOUR_TRIGGER:
+			parkour_next += 1
+			if net_mode == NetMode.SERVER:
+				parkour_set_next.rpc(parkour_next)
+			else:
+				_parkour_highlight()
+			if parkour_next >= parkour_pts.size():
+				for i in PARKOUR_GEMS:
+					_spawn_gem(target + Vector3(randf_range(-1.5, 1.5), randf_range(-1.5, 1.5), 0), 50)
+				_event_announce("🏁 KURS GESCHAFFT — fette Beute!")
+				_end_event()
+				return
+	parkour_obj_accum -= delta
+	if parkour_obj_accum <= 0.0:
+		parkour_obj_accum = 0.5
+		_set_objective("🏁 Parkour — Ring %d/%d  ·  %ds" % [parkour_next, parkour_pts.size(), int(ceil(parkour_timer))])
+
 # Tear down the active event and arm the next countdown.
 func _end_event() -> void:
 	if escort_bot != null:
 		_despawn_friendly_entity(escort_bot)
 		escort_bot = null
+	_clear_parkour()
 	mega_active = null
 	active_event = ""
 	event_timer = randf_range(EVENT_INTERVAL_MIN, EVENT_INTERVAL_MAX)
@@ -4157,11 +4240,23 @@ func _reset_events() -> void:
 	friendlies.clear()
 	escort_bot = null
 	escort_markers.clear()
+	_clear_parkour()
 	mega_active = null
 	active_event = ""
 	escort_timer = 0.0
 	event_timer = randf_range(EVENT_INTERVAL_MIN, EVENT_INTERVAL_MAX)
 	_set_objective("")
+
+# Drop the parkour course (authority tells clients; everyone clears local rings).
+func _clear_parkour() -> void:
+	if parkour_pts.is_empty() and parkour_nodes.is_empty():
+		return
+	if net_mode == NetMode.SERVER:
+		despawn_parkour.rpc()
+	else:
+		_clear_parkour_rings()
+	parkour_pts = PackedVector3Array()
+	parkour_next = 0
 
 # Despawn wave enemies + gems that have been outside EVERY player's radar range
 # for FAR_DESPAWN_TIME, so the persistent world doesn't pile up leftovers. Event
@@ -4331,6 +4426,87 @@ func _despawn_enemy_entity(e) -> void:
 		despawn_enemy.rpc(e.net_id)
 	elif e.node != null:
 		e.node.queue_free()
+
+# ---- Ring parkour: visuals + sync ----
+@rpc("authority", "call_remote", "reliable")
+func spawn_parkour(pts: PackedVector3Array) -> void:
+	if net_mode != NetMode.CLIENT or home_probing:
+		return
+	parkour_pts = pts
+	parkour_next = 0
+	_build_parkour_rings(pts)
+
+@rpc("authority", "call_remote", "reliable")
+func parkour_set_next(idx: int) -> void:
+	if net_mode != NetMode.CLIENT or home_probing:
+		return
+	parkour_next = idx
+	_parkour_highlight()
+
+@rpc("authority", "call_remote", "reliable")
+func despawn_parkour() -> void:
+	if net_mode != NetMode.CLIENT or home_probing:
+		return
+	_clear_parkour_rings()
+
+# Build the ring meshes (client/single). Each torus' hole axis points along the
+# course so you fly through it; colours come from _parkour_highlight.
+func _build_parkour_rings(pts: PackedVector3Array) -> void:
+	for r in parkour_nodes:
+		if r != null:
+			r.queue_free()
+	parkour_nodes.clear()
+	for i in pts.size():
+		var ring := MeshInstance3D.new()
+		var tm := TorusMesh.new()
+		tm.inner_radius = PARKOUR_RING_R - 0.45
+		tm.outer_radius = PARKOUR_RING_R
+		ring.mesh = tm
+		var mat := StandardMaterial3D.new()
+		mat.emission_enabled = true
+		mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		ring.material_override = mat
+		ring.position = pts[i]
+		# Aim the torus hole (default +Y) along the path direction (in XY).
+		var d: Vector3 = Vector3.RIGHT
+		if i < pts.size() - 1:
+			d = pts[i + 1] - pts[i]
+		elif i > 0:
+			d = pts[i] - pts[i - 1]
+		d.z = 0.0
+		if d.length() > 0.01:
+			ring.rotation_degrees = Vector3(0, 0, rad_to_deg(atan2(d.y, d.x)) - 90.0)
+		world.add_child(ring)
+		parkour_nodes.append(ring)
+	_parkour_highlight()
+
+# Recolour rings: passed = green, next = bright cyan, pending = blue.
+func _parkour_highlight() -> void:
+	for i in parkour_nodes.size():
+		var ring: MeshInstance3D = parkour_nodes[i]
+		if ring == null:
+			continue
+		var mat: StandardMaterial3D = ring.material_override
+		if i < parkour_next:
+			mat.albedo_color = Color(0.3, 1.0, 0.5)
+			mat.emission = Color(0.2, 0.8, 0.4)
+			mat.emission_energy_multiplier = 1.2
+		elif i == parkour_next:
+			mat.albedo_color = Color(0.5, 1.0, 1.0)
+			mat.emission = Color(0.5, 1.0, 1.0)
+			mat.emission_energy_multiplier = 4.5
+		else:
+			mat.albedo_color = Color(0.45, 0.7, 1.0)
+			mat.emission = Color(0.3, 0.5, 1.0)
+			mat.emission_energy_multiplier = 1.6
+
+func _clear_parkour_rings() -> void:
+	for r in parkour_nodes:
+		if r != null:
+			r.queue_free()
+	parkour_nodes.clear()
+	parkour_pts = PackedVector3Array()
+	parkour_next = 0
 
 func _make_enemy_mesh(kind: String) -> Node3D:
 	var root := Node3D.new()
@@ -4875,7 +5051,20 @@ const ESCORT_BOT_HP := 700                  # bot HP (drained by the markers' fi
 const ESCORT_TIME := 90.0                   # seconds to reach + clear the markers
 const ESCORT_MARKERS := 6                   # number of marked shooters
 const ESCORT_GEMS := 30                     # loot shower on success
-# Shared event cadence (one world event — mega OR escort — at a time).
+# Event C — Ring Parkour: fly through a chain of rings in order, against the clock.
+const PARKOUR_MIN_LEVEL := 4
+const PARKOUR_RINGS := 8
+const PARKOUR_SPAWN_MIN := 60.0             # distance to the first ring
+const PARKOUR_SPAWN_MAX := 100.0
+const PARKOUR_STEP := 18.0                  # gap between consecutive rings
+const PARKOUR_TURN := 0.7                   # max heading change per ring (winding course)
+const PARKOUR_TRIGGER := 4.5                # fly-through proximity radius
+const PARKOUR_TIME := 60.0                  # time for the whole course
+const PARKOUR_RING_R := 3.0                 # ring radius
+const PARKOUR_GEMS := 30                    # loot shower on completion
+const PARKOUR_DETECT := 240.0               # radar reveal range for the next ring
+
+# Shared event cadence (one world event at a time — escort / parkour / mega).
 const EVENT_INTERVAL_MIN := 80.0
 const EVENT_INTERVAL_MAX := 150.0
 
@@ -7793,6 +7982,7 @@ func _coop_clear_world() -> void:
 			f.node.queue_free()
 	friendlies.clear()
 	cl_friendlies.clear()
+	_clear_parkour_rings()
 	_apply_objective("")
 	enemies.clear()
 	p_bullets.clear()
