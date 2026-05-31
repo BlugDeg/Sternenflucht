@@ -8,20 +8,8 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.1.0"
+const GAME_VERSION := "0.3.0"
 
-const MODEL_PLAYER_BASE   := preload("res://assets/ships/craft_racer.glb")
-const MODEL_TURRET_SINGLE := preload("res://assets/ships/turret_single.glb")
-const MODEL_TURRET_DOUBLE := preload("res://assets/ships/turret_double.glb")
-const MODEL_WEAPON_GUN    := preload("res://assets/ships/weapon_gun.glb")
-const MODEL_SAT_DISH      := preload("res://assets/ships/satelliteDish.glb")
-const MODEL_SAT_DISH_DET  := preload("res://assets/ships/satelliteDish_detailed.glb")
-const MODEL_FINS_A        := preload("res://assets/ships/rocket_finsA.glb")
-const MODEL_NOSE          := preload("res://assets/ships/rocket_topA.glb")
-const MODEL_BARRELS       := preload("res://assets/ships/barrels.glb")
-
-# Kenney models face -Z; we want +X forward → rotate Y by -90°
-const MODEL_FACING := Vector3(0, -90, 0)
 
 # Arena (in world units)
 const ARENA_W := 36.0
@@ -56,11 +44,18 @@ const MAX_ENEMIES := 60
 # Wave
 const WAVE_DURATION := 28.0
 const BOSS_EVERY := 5
+# Enemy composition is gated by player level (party-max in co-op), not just elapsed
+# waves — a low-level player never faces shooters/tanks/bosses they can't handle.
+const SHOOTER_MIN_LEVEL := 2
+const TANK_MIN_LEVEL := 4
+const BOSS_MIN_LEVEL := 5
 
 # States
 const STATE_PLAYING := 0
 const STATE_LEVELUP := 1
 const STATE_GAMEOVER := 2
+const STATE_HOME := 3      # start / home screen, shown before any run begins
+const STATE_SHIPYARD := 4  # modular ship-builder / hangar, opened from the home screen
 
 # Colors
 const COL_TEXT := Color(0.95, 0.97, 1.0)
@@ -99,6 +94,11 @@ class Entity:
 	var pierce: int = 0
 	var hit_flash: float = 0.0
 	var node: Node3D = null   # the visual MeshInstance3D / Node3D in the scene
+	# Multiplayer fields
+	var net_id: int = 0       # server-assigned network id (0 = local/single-player)
+	var dna: Dictionary = {}  # enemy: procedural recipe, sent to clients so they rebuild the mesh
+	var owner_id: int = 0     # player bullet: peer id of the player who fired it
+	var tpos: Vector3 = Vector3.ZERO  # client: target position from the latest snapshot (lerp toward)
 
 # Radar mini-map — bottom-right HUD overlay. Sci-fi style with a rotating
 # sweep beam that brightens contacts as it passes over them, soft glow halos
@@ -138,6 +138,19 @@ class RadarPanel extends Control:
 		if diff < 0.0 or diff > 0.6:
 			return 0.0
 		return 1.0 - diff / 0.6  # linear fade across ~34°
+
+	# Rim arrow for a fellow player — green-cyan chevron pointing outward,
+	# distinct from the warm enemy blips so allies read at a glance.
+	func _draw_player_arrow(at: Vector2, dir: Vector2) -> void:
+		var ally: Color = Color(0.4, 1.0, 0.7)
+		# Soft halo
+		draw_circle(at, 5.5, Color(ally.r, ally.g, ally.b, 0.22))
+		var perp: Vector2 = Vector2(-dir.y, dir.x)
+		var tip: Vector2 = at + dir * 5.0
+		var base_l: Vector2 = at - dir * 3.0 + perp * 4.0
+		var base_r: Vector2 = at - dir * 3.0 - perp * 4.0
+		draw_polygon(PackedVector2Array([tip, base_l, base_r]),
+			PackedColorArray([ally]))
 
 	func _draw() -> void:
 		if main == null:
@@ -237,6 +250,19 @@ class RadarPanel extends Control:
 				var fade_col: Color = Color(col.r, col.g, col.b, 0.55)
 				_draw_blip(pt, fade_col, sz * 0.75, 0.4 + _sweep_intensity(ang_e) * 0.6)
 
+		# Other players — always pinned to the rim with a directional arrow,
+		# regardless of distance, so the party can find each other.
+		for id in main.remote_players:
+			var rp: Dictionary = main.remote_players[id]
+			var rpos: Vector3 = rp["tpos"]
+			var dxy_p: Vector3 = rpos - p_pos
+			var dir_p: Vector2 = Vector2(dxy_p.x, -dxy_p.y)
+			if dir_p.length() < 0.001:
+				continue
+			dir_p = dir_p.normalized()
+			var at_p: Vector2 = c + dir_p * (r - 6.0)
+			_draw_player_arrow(at_p, dir_p)
+
 		# Player at the centre — bright glowing triangle pointing in p_facing
 		var f: Vector3 = main.p_facing
 		var fv: Vector2 = Vector2(f.x, -f.y).normalized()
@@ -284,9 +310,12 @@ var visual_armor: Array = []
 var visual_sensors: Array = []
 var visual_pierce: Node3D = null
 var visual_pickup_ring: Node3D = null
-var visual_speed_fins: Array = []
+var visual_speed_fins: Array = []   # legacy (speed now uses engine pods); kept for safe reset
 var visual_damage_core: Node3D = null
 var visual_damage_lvl: int = 0
+var visual_rate_coils: Array = []    # fire-rate: weapon cooling / overclock coils near the guns
+var visual_boost_tanks: Array = []   # boost capacity: fuel canisters on the rear spine
+var visual_boost_nozzle: Node3D = null  # boost strength: afterburner nozzles (rebuilt, grows)
 
 # Player upgrades
 var u_speed_mult: float = 1.0
@@ -366,12 +395,12 @@ var mat_gem: StandardMaterial3D
 
 # UI
 var hud: CanvasLayer
+var hud_game: Control = null   # container for all gameplay HUD; hidden on the home screen
 var lbl_hp: Label
 var lbl_xp: Label
 var lbl_wave: Label
 var lbl_time: Label
 var lbl_stats: Label
-var lbl_pause: Label
 var bar_hp_fill: ColorRect
 var bar_xp_fill: ColorRect
 var bar_boost_bg: ColorRect
@@ -396,11 +425,92 @@ var update_asset_url: String = ""   # browser_download_url of the new Sternenflu
 var update_new_version: String = ""
 
 # ============================================================
+# Multiplayer (co-op) — the SAME build runs as single-player (default,
+# double-click), a dedicated headless server ("-- --server"), or a client
+# joining a server ("-- --connect <ip>"). Server is authoritative; clients
+# render. Plain ENet + RPC (no MultiplayerSpawner/Synchronizer).
+# ============================================================
+enum NetMode { SINGLE, SERVER, CLIENT }
+const NET_PORT := 7777
+const DEFAULT_SERVER := "sternenflucht.it-en.ch"   # public co-op server (home-screen probe + join)
+const NET_MAX_CLIENTS := 32
+const NET_TICK := 1.0 / 20.0          # network snapshot rate (20 Hz)
+const HS_MAX := 50                    # max highscore entries kept
+const HS_FILE := "user://highscores.json"        # server: shared list / single-player: local list
+const SETTINGS_FILE := "user://settings.cfg"     # client: name + audio + fullscreen
+var net_mode: int = NetMode.SINGLE
+var net_server_ip: String = ""   # empty → home screen uses DEFAULT_SERVER; --connect overrides (incl. localhost/LAN)
+var net_connected: bool = false
+var net_send_accum: float = 0.0
+var remote_players := {}              # client: id -> { node: Node3D, tpos: Vector3, tyaw: float }
+var net_states := {}                  # server: id -> { pos: Vector3, yaw: float, invuln: float }
+var net_next_id: int = 1              # server: incrementing id pool for enemies/bullets/gems
+# Client render maps (net_id -> Entity). Kept in lock-step with the enemies/p_bullets/
+# e_bullets/gems arrays so radar + auto-aim keep working unchanged on clients.
+var cl_enemies := {}
+var cl_pbullets := {}
+var cl_ebullets := {}
+var cl_gems := {}
+var cl_designs := {}                  # client: id -> ship_design of each remote player (built into their mesh)
+
+# Player identity + social
+var player_name: String = ""          # this client's chosen name (roster + highscore)
+var net_roster := {}                  # client: id -> {name, level} (server-reported online list)
+var highscores: Array = []            # entries {name, level, wave, kills, time}; server-global or local
+
+# ESC self-pause menu + settings
+var menu_open: bool = false           # ESC screen visible (self-pause)
+var esc_panel: Control = null
+var esc_roster_label: Label = null
+var esc_board_label: Label = null
+var settings_panel: Control = null
+var name_edit: LineEdit = null
+var vol_slider: HSlider = null
+var fullscreen_check: CheckBox = null
+var master_vol_db: float = 0.0        # persisted master bus volume
+var fullscreen_on: bool = false       # persisted fullscreen preference
+
+# Game-over highscore UI
+var go_name_edit: LineEdit = null
+var go_save_btn: Button = null
+var go_board_label: Label = null
+var score_submitted: bool = false
+
+# --- Home / start screen ---
+var home_panel: Control = null
+var home_status_label: Label = null
+var home_board_label: Label = null
+var home_best_label: Label = null
+var home_name_edit: LineEdit = null
+var home_coop_btn: Button = null
+var home_preferred_coop: bool = false   # launched via the co-op .bat → pre-highlight Co-op
+
+# --- Ship builder / hangar (STATE_SHIPYARD) ---
+var ship_design: Dictionary = {}          # cosmetic design; filled by _load_settings (default if no file)
+var shipyard_panel: Control = null
+var shipyard_val_labels: Dictionary = {}  # category key -> Label showing the current option
+var _shipyard_backup: Dictionary = {}     # design snapshot on open, restored by "Verwerfen"
+var home_probing: bool = false          # a lightweight reachability probe is in flight
+var probe_timer: float = 0.0            # connection timeout, shrinks once connected
+var home_ship_spin: float = 0.0         # turntable angle for the showcased ship
+# Personal best run, persisted locally in settings.cfg (separate from the leaderboard).
+var best_level: int = 0
+var best_wave: int = 0
+var best_kills: int = 0
+var best_time: int = 0
+
+# ============================================================
 # Lifecycle
 # ============================================================
 
 func _ready() -> void:
+	_parse_net_mode()
+	# Dedicated server: headless authority only — no rendering, no audio, no UI.
+	if net_mode == NetMode.SERVER:
+		_start_dedicated_server()
+		return
 	randomize()
+	_load_settings()
 	_build_environment()
 	_build_camera()
 	_build_lights()
@@ -414,11 +524,935 @@ func _ready() -> void:
 	_build_speedlines()
 	_build_levelup_panel()
 	_build_go_panel()
+	_build_esc_panel()
+	_apply_settings()
 	p_hp = p_max_hp
 	_build_updater_ui()
 	# Only check for updates from a real exported build (skip editor & server).
 	if not OS.has_feature("editor") and not OS.has_feature("dedicated_server"):
 		_check_for_updates()
+	# Both the double-click launch and the co-op .bat now land on the start screen
+	# first. A --connect launch just pre-selects co-op and remembers the address.
+	_setup_net_signals()
+	_build_home_panel()
+	_build_shipyard_panel()
+	home_preferred_coop = (net_mode == NetMode.CLIENT)   # co-op .bat → pre-highlight + keep its address
+	net_mode = NetMode.SINGLE   # neutral until the player picks on the home screen
+	_show_home()
+
+# Reads launch args: dedicated_server feature or "--server" → SERVER,
+# "--connect <ip>" / "--connect=<ip>" → CLIENT, otherwise SINGLE.
+func _parse_net_mode() -> void:
+	if OS.has_feature("dedicated_server"):
+		net_mode = NetMode.SERVER
+	var args := OS.get_cmdline_user_args()
+	for i in args.size():
+		var a := args[i]
+		if a == "--server":
+			net_mode = NetMode.SERVER
+		elif a == "--connect":
+			net_mode = NetMode.CLIENT
+			if i + 1 < args.size():
+				net_server_ip = args[i + 1]
+		elif a.begins_with("--connect="):
+			net_mode = NetMode.CLIENT
+			net_server_ip = a.substr("--connect=".length())
+
+# ============================================================
+# Networking — server (authoritative, headless)
+# ============================================================
+
+func _start_dedicated_server() -> void:
+	randomize()
+	var peer := ENetMultiplayerPeer.new()
+	var err := peer.create_server(NET_PORT, NET_MAX_CLIENTS)
+	if err != OK:
+		push_error("[MP] create_server fehlgeschlagen: %d" % err)
+		return
+	multiplayer.multiplayer_peer = peer
+	multiplayer.peer_connected.connect(_on_peer_connected)
+	multiplayer.peer_disconnected.connect(_on_peer_disconnected)
+	_load_highscores_server()
+	print("[MP] Dedizierter Server laeuft auf Port %d (max %d Spieler)" % [NET_PORT, NET_MAX_CLIENTS])
+
+func _on_peer_connected(id: int) -> void:
+	# Each player carries their OWN wave progression, spawn cadence and kill count —
+	# waves are per-player, not a single global counter (which used to run away to
+	# wave 100+ because the dedicated server simulates 24/7).
+	net_states[id] = {"pos": Vector3.ZERO, "yaw": 0.0, "invuln": 0.0, "busy": false,
+		"level": 1, "name": "Pilot", "wave": 1, "wave_timer": WAVE_DURATION,
+		"spawn_timer": 1.5, "kills": 0, "design": DEFAULT_SHIP_DESIGN.duplicate()}
+	print("[MP] Spieler verbunden: %d  (online: %d)" % [id, net_states.size()])
+	_broadcast_roster()
+
+func _on_peer_disconnected(id: int) -> void:
+	net_states.erase(id)
+	if net_states.is_empty():
+		# Last player left — reset the shared world so the next session starts clean
+		# (otherwise leftover enemies from a previous session linger on the 24/7 server).
+		enemies.clear()
+		p_bullets.clear()
+		e_bullets.clear()
+		gems.clear()
+	print("[MP] Spieler getrennt: %d  (online: %d)" % [id, net_states.size()])
+	_broadcast_roster()
+
+func _next_net_id() -> int:
+	net_next_id += 1
+	return net_next_id
+
+func _server_process(delta: float) -> void:
+	if multiplayer.multiplayer_peer == null:
+		return
+	# Run the authoritative world simulation every frame for smooth AI,
+	_server_sim(delta)
+	# but only broadcast a snapshot at the network tick rate.
+	net_send_accum += delta
+	if net_send_accum < NET_TICK:
+		return
+	net_send_accum = 0.0
+	_server_broadcast()
+
+# The whole shared world lives on the server: enemies, both bullet kinds, gems,
+# wave timing and all collisions. Mesh/audio building is skipped (headless).
+func _server_sim(delta: float) -> void:
+	for id in net_states:
+		net_states[id]["invuln"] = max(0.0, net_states[id]["invuln"] - delta)
+	_server_update_enemies(delta)
+	_server_update_bullets(p_bullets, delta)
+	_server_update_bullets(e_bullets, delta)
+	_server_update_gems(delta)
+	_server_update_spawning(delta)
+	_server_update_waves(delta)
+	_server_resolve_collisions()
+	_purge_dead()
+
+# Closest connected player's position to a point (enemy AI target). Returns a far
+# offset when nobody is connected so idle enemies just drift.
+func _nearest_player_pos(from: Vector3) -> Vector3:
+	var best: Vector3 = from + Vector3(0, 100, 0)
+	var best_d: float = INF
+	for id in net_states:
+		var pp: Vector3 = net_states[id]["pos"]
+		var d: float = pp.distance_to(from)
+		if d < best_d:
+			best_d = d
+			best = pp
+	return best
+
+func _server_update_enemies(delta: float) -> void:
+	for e in enemies:
+		if e.dead:
+			continue
+		e.hit_flash = max(0.0, e.hit_flash - delta * 4.0)
+		var tgt: Vector3 = _nearest_player_pos(e.pos)
+		match e.type:
+			"drone":
+				_ai_chase(e, delta, 5.0, tgt)
+			"shooter":
+				_ai_keep_distance(e, delta, 4.2, 11.0, tgt)
+				_ai_shoot(e, delta, 8, 9.5, tgt)
+			"tank":
+				_ai_chase(e, delta, 2.8, tgt)
+			"boss":
+				_ai_boss(e, delta, tgt)
+		e.pos += e.vel * delta
+
+# Move + expire only (no arena cull — that uses the local player's position which
+# is meaningless on the server).
+func _server_update_bullets(arr: Array, delta: float) -> void:
+	for b in arr:
+		if b.dead:
+			continue
+		b.pos += b.vel * delta
+		b.lifetime -= delta
+		if b.lifetime <= 0.0:
+			b.dead = true
+
+func _server_update_gems(delta: float) -> void:
+	for g in gems:
+		if g.dead:
+			continue
+		# Find the nearest player; magnet toward them and grant XP on pickup.
+		var np_id: int = -1
+		var nd: float = INF
+		var npp: Vector3 = Vector3.ZERO
+		for id in net_states:
+			var pp: Vector3 = net_states[id]["pos"]
+			var d: float = pp.distance_to(g.pos)
+			if d < nd:
+				nd = d
+				np_id = id
+				npp = pp
+		if np_id == -1:
+			continue
+		if nd <= P_PICKUP_RANGE:
+			g.vel = g.vel.lerp((npp - g.pos).normalized() * 20.0 * (1.5 - nd / P_PICKUP_RANGE), clamp(delta * 8.0, 0.0, 1.0))
+		else:
+			g.vel = g.vel.lerp(Vector3.ZERO, clamp(delta * 4.0, 0.0, 1.0))
+		g.pos += g.vel * delta
+		if nd <= P_RADIUS + g.radius:
+			g.dead = true
+			grant_xp.rpc_id(np_id, g.value)
+
+# Per-player spawning: every non-busy player gets their OWN stream of enemies in
+# their OWN area, scaled to THEIR wave + level. When two players are close their
+# streams overlap, so both wave levels spawn around them at the same time. Busy
+# players (level-up / ESC / death screen) get nothing — a safe breather.
+func _server_update_spawning(delta: float) -> void:
+	if net_states.is_empty():
+		return
+	for id in net_states:
+		var st: Dictionary = net_states[id]
+		if st.get("busy", false):
+			continue
+		st["spawn_timer"] = float(st.get("spawn_timer", 1.5)) - delta
+		if st["spawn_timer"] > 0.0:
+			continue
+		var pw: int = int(st.get("wave", 1))
+		st["spawn_timer"] = max(0.35, 1.5 - pw * 0.08)   # this player's wave drives their cadence
+		if _alive_enemy_count() >= MAX_ENEMIES:
+			continue
+		var center: Vector3 = st["pos"]
+		var ang: float = randf() * TAU
+		var pos: Vector3 = center + Vector3(cos(ang), sin(ang), 0) * SPAWN_RING
+		_spawn_enemy(_pick_enemy_kind(int(st.get("level", 1))), pos, pw)
+
+# Per-player wave progression: each player's wave advances on its own timer, and
+# their boss waves trigger in their own area — independent of every other player.
+func _server_update_waves(delta: float) -> void:
+	for id in net_states:
+		var st: Dictionary = net_states[id]
+		if st.get("busy", false):
+			continue
+		st["wave_timer"] = float(st.get("wave_timer", WAVE_DURATION)) - delta
+		if st["wave_timer"] <= 0.0:
+			st["wave"] = int(st.get("wave", 1)) + 1
+			st["wave_timer"] = WAVE_DURATION
+			var pw: int = int(st["wave"])
+			var lvl: int = int(st.get("level", 1))
+			if pw % BOSS_EVERY == 0 and lvl >= BOSS_MIN_LEVEL:
+				_spawn_boss_for(id)
+
+# Spawn a boss in one player's area, scaled to that player's wave.
+func _spawn_boss_for(id: int) -> void:
+	if not net_states.has(id) or _alive_enemy_count() >= MAX_ENEMIES:
+		return
+	var st: Dictionary = net_states[id]
+	var center: Vector3 = st["pos"]
+	var ang: float = randf() * TAU
+	_spawn_enemy("boss", center + Vector3(cos(ang), sin(ang), 0) * (SPAWN_RING * 0.6), int(st.get("wave", 1)))
+
+func _server_resolve_collisions() -> void:
+	# Player bullets vs enemies.
+	for b in p_bullets:
+		if b.dead:
+			continue
+		for e in enemies:
+			if e.dead:
+				continue
+			if b.pos.distance_to(e.pos) <= b.radius + e.radius:
+				e.hp -= b.damage
+				e.hit_flash = 1.0
+				if b.pierce > 0:
+					b.pierce -= 1
+				else:
+					b.dead = true
+				if e.hp <= 0:
+					_kill_enemy(e, b.owner_id)   # credit the kill to whoever fired this bullet
+				if b.dead:
+					break
+	# Enemy bullets vs each player.
+	for b in e_bullets:
+		if b.dead:
+			continue
+		for id in net_states:
+			if net_states[id]["invuln"] > 0.0 or net_states[id].get("busy", false):
+				continue
+			if b.pos.distance_to(net_states[id]["pos"]) <= P_RADIUS + b.radius:
+				_server_hit_player(id, b.damage)
+				b.dead = true
+				break
+	# Enemy bodies vs each player.
+	for e in enemies:
+		if e.dead:
+			continue
+		for id in net_states:
+			if net_states[id]["invuln"] > 0.0 or net_states[id].get("busy", false):
+				continue
+			var pp: Vector3 = net_states[id]["pos"]
+			if e.pos.distance_to(pp) <= P_RADIUS + e.radius:
+				_server_hit_player(id, e.damage)
+				e.pos += (e.pos - pp).normalized() * 1.6
+
+func _server_hit_player(id: int, dmg: int) -> void:
+	net_states[id]["invuln"] = P_INVULN
+	hit_player.rpc_id(id, dmg)
+
+func _server_spawn_p_bullet(pos: Vector3, vel: Vector3, dmg: int, pierce: int, lifetime: float, by_owner: int) -> void:
+	var b := Entity.new()
+	b.type = "p_bullet"
+	b.pos = pos
+	b.vel = vel
+	b.radius = PROJ_RADIUS
+	b.damage = dmg
+	b.pierce = pierce
+	b.lifetime = lifetime
+	b.owner_id = by_owner
+	b.net_id = _next_net_id()
+	p_bullets.append(b)
+
+# Build and send the per-tick world snapshot. Enemies are spawned via a separate
+# reliable RPC (their DNA), so here they only carry positions; bullets/gems are
+# created client-side on first sight from this snapshot.
+func _server_broadcast() -> void:
+	# Everything lives on the z=0 play plane, so positions/velocities are sent as
+	# Vector2. Bulk entity data goes into parallel typed packed arrays (ids +
+	# positions [+ velocities]) instead of keyed Dictionaries: PackedInt32Array /
+	# PackedVector2Array serialize as raw blocks with no per-entry Variant boxing,
+	# which roughly halves the snapshot vs the old Dictionary form and keeps it under
+	# the ~1392 B MTU for far more entities (the Dictionary form overflowed at ~24).
+	var pid := PackedInt32Array()
+	var ppos := PackedVector2Array()
+	var pyaw := PackedFloat32Array()
+	var pwave := PackedInt32Array()    # each player's own wave (per-player, not global)
+	var pkills := PackedInt32Array()   # each player's own kill count
+	for id in net_states:
+		var st: Dictionary = net_states[id]
+		var sp: Vector3 = st["pos"]
+		pid.append(id)
+		ppos.append(Vector2(sp.x, sp.y))
+		pyaw.append(st["yaw"])
+		pwave.append(int(st.get("wave", 1)))
+		pkills.append(int(st.get("kills", 0)))
+	var eid := PackedInt32Array()
+	var epos := PackedVector2Array()
+	for e in enemies:
+		if not e.dead:
+			eid.append(e.net_id)
+			epos.append(Vector2(e.pos.x, e.pos.y))
+	var gid := PackedInt32Array()
+	var gpos := PackedVector2Array()
+	for g in gems:
+		if not g.dead:
+			gid.append(g.net_id)
+			gpos.append(Vector2(g.pos.x, g.pos.y))
+	receive_world.rpc({
+		"pid": pid, "ppos": ppos, "pyaw": pyaw, "pwave": pwave, "pkills": pkills,
+		"eid": eid, "epos": epos,
+		"gid": gid, "gpos": gpos,
+	})
+	# Bullets are by far the bulk of the snapshot (rapid fire + multi-projectile +
+	# enemy fire), so they go in their own unreliable packet — they never share an
+	# MTU budget with players/enemies/gems, which keeps both packets well under the
+	# ~1392 B MTU. Clients dead-reckon bullet motion by velocity between packets, so a
+	# dropped bullet packet is invisible.
+	var pbid := PackedInt32Array()
+	var pbpos := PackedVector2Array()
+	var pbvel := PackedVector2Array()
+	for b in p_bullets:
+		if not b.dead:
+			pbid.append(b.net_id)
+			pbpos.append(Vector2(b.pos.x, b.pos.y))
+			pbvel.append(Vector2(b.vel.x, b.vel.y))
+	var ebid := PackedInt32Array()
+	var ebpos := PackedVector2Array()
+	var ebvel := PackedVector2Array()
+	for b in e_bullets:
+		if not b.dead:
+			ebid.append(b.net_id)
+			ebpos.append(Vector2(b.pos.x, b.pos.y))
+			ebvel.append(Vector2(b.vel.x, b.vel.y))
+	receive_bullets.rpc({
+		"pbid": pbid, "pbpos": pbpos, "pbvel": pbvel,
+		"ebid": ebid, "ebpos": ebpos, "ebvel": ebvel,
+	})
+
+# Clients push their own transform (and current level, for difficulty scaling)
+# here; only the server records it.
+@rpc("any_peer", "unreliable_ordered")
+func submit_player_state(pos: Vector3, yaw: float, level: int) -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	var sender := multiplayer.get_remote_sender_id()
+	if not net_states.has(sender):
+		net_states[sender] = {"pos": pos, "yaw": yaw, "invuln": 0.0, "busy": false, "level": level}
+	else:
+		net_states[sender]["pos"] = pos
+		net_states[sender]["yaw"] = yaw
+		net_states[sender]["level"] = level
+
+# A client opens/closes its level-up menu. The shared world can't pause for one
+# player, so instead the server marks them busy → immune to damage while choosing,
+# plus a short grace on resume so they aren't instantly hit by enemies that closed
+# in during the menu.
+@rpc("any_peer", "call_remote", "reliable")
+func notify_busy(b: bool) -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	var sender := multiplayer.get_remote_sender_id()
+	if not net_states.has(sender):
+		return
+	net_states[sender]["busy"] = b
+	if not b:
+		net_states[sender]["invuln"] = maxf(net_states[sender]["invuln"], 1.0)
+
+# A client restarted its run after dying (co-op). Reset that player's per-player
+# wave progression, spawn cadence and kill count so they truly start over —
+# otherwise the next snapshot would push the old wave/kills straight back.
+@rpc("any_peer", "call_remote", "reliable")
+func reset_my_run() -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	var sender := multiplayer.get_remote_sender_id()
+	if not net_states.has(sender):
+		return
+	net_states[sender]["wave"] = 1
+	net_states[sender]["wave_timer"] = WAVE_DURATION
+	net_states[sender]["spawn_timer"] = 1.5
+	net_states[sender]["kills"] = 0
+
+# A client fired: the server creates the authoritative bullets (using the stats
+# the client reported — trusting clients is fine for friendly co-op).
+@rpc("any_peer", "call_remote", "reliable")
+func fire_bullets(origin: Vector3, base_a: float, n: int, spread_deg: float, dmg: int, pierce: int, lifetime: float, speed: float) -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	var sender := multiplayer.get_remote_sender_id()
+	n = clampi(n, 1, 32)
+	var spread: float = deg_to_rad(spread_deg)
+	for i in n:
+		var t: float = 0.5 if n == 1 else float(i) / float(n - 1)
+		var off: float = (t - 0.5) * spread * (1.0 if n > 1 else 0.0)
+		var a: float = base_a + off
+		var muzzle_pos: Vector3 = origin + Vector3(cos(a), sin(a), 0) * 0.8
+		var bullet_vel: Vector3 = Vector3(cos(a), sin(a), 0) * speed
+		_server_spawn_p_bullet(muzzle_pos, bullet_vel, dmg, pierce, lifetime, sender)
+
+# ============================================================
+# Networking — roster (who's online) + highscores (server-authoritative)
+# ============================================================
+
+# A client reports its display name; the server records it and re-broadcasts the
+# online roster so everyone's ESC screen updates.
+@rpc("any_peer", "call_remote", "reliable")
+func set_player_name(pname: String) -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	var sender := multiplayer.get_remote_sender_id()
+	if not net_states.has(sender):
+		return
+	net_states[sender]["name"] = _sanitize_name(pname)
+	_broadcast_roster()
+
+# id -> {name, level} for every connected player.
+func _build_roster() -> Dictionary:
+	var r := {}
+	for id in net_states:
+		r[id] = {
+			"name": net_states[id].get("name", "Pilot"),
+			"level": int(net_states[id].get("level", 1)),
+		}
+	return r
+
+func _broadcast_roster() -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	receive_roster.rpc(_build_roster())
+
+# A client asks for a fresh roster / highscore list (e.g. on opening ESC or on connect).
+@rpc("any_peer", "call_remote", "reliable")
+func request_roster() -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	receive_roster.rpc_id(multiplayer.get_remote_sender_id(), _build_roster())
+
+# ============================================================
+# Networking — modular ship designs (cosmetic; like enemy DNA, too varied for the
+# unreliable snapshot, so sent reliably once on join and re-broadcast on change).
+# The server only stores + relays the design data — it NEVER builds a mesh
+# (headless authority). Clients build each peer's ship from the received design.
+# ============================================================
+
+# A client reports its ship design. The server validates it (so a malformed
+# design can never reach other clients' mesh builder), stores it on the peer's
+# state, and re-broadcasts every design so all clients rebuild affected ships.
+@rpc("any_peer", "call_remote", "reliable")
+func submit_ship_design(design: Dictionary) -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	var sender := multiplayer.get_remote_sender_id()
+	if not net_states.has(sender):
+		return
+	net_states[sender]["design"] = _sanitize_ship_design(design)
+	_broadcast_designs()
+
+# Clamp/whitelist every field so the server only ever relays well-formed designs.
+func _sanitize_ship_design(d: Dictionary) -> Dictionary:
+	var out := DEFAULT_SHIP_DESIGN.duplicate()
+	out["palette"] = clampi(int(d.get("palette", 0)), 0, SHIP_PALETTES.size() - 1)
+	var w := str(d.get("wings", "swept"))
+	out["wings"] = w if w in SHIP_WING_OPTS else "swept"
+	return out
+
+# id -> ship_design for every connected player.
+func _build_designs() -> Dictionary:
+	var r := {}
+	for id in net_states:
+		r[id] = net_states[id].get("design", DEFAULT_SHIP_DESIGN)
+	return r
+
+func _broadcast_designs() -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	receive_ship_designs.rpc(_build_designs())
+
+# A joining client pulls every current design so it can build ships already online.
+@rpc("any_peer", "call_remote", "reliable")
+func request_ship_designs() -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	receive_ship_designs.rpc_id(multiplayer.get_remote_sender_id(), _build_designs())
+
+@rpc("any_peer", "call_remote", "reliable")
+func request_highscores() -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	receive_highscores.rpc_id(multiplayer.get_remote_sender_id(), highscores)
+
+# A client submits a finished run. The server stores it, sorts, trims, persists to
+# disk, and broadcasts the updated board to everyone.
+@rpc("any_peer", "call_remote", "reliable")
+func submit_score(pname: String, level: int, wave_n: int, kills_n: int, time_s: int) -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	var entry := {
+		"name": _sanitize_name(pname),
+		"level": clampi(level, 1, 9999),
+		"wave": clampi(wave_n, 1, 99999),
+		"kills": clampi(kills_n, 0, 9999999),
+		"time": clampi(time_s, 0, 999999),
+	}
+	highscores.append(entry)
+	_sort_highscores()
+	if highscores.size() > HS_MAX:
+		highscores.resize(HS_MAX)
+	_save_highscores_server()
+	receive_highscores.rpc(highscores)
+
+# Sort by level, then wave, then kills, then (shorter) time — "who reached the
+# highest level" first.
+func _sort_highscores() -> void:
+	highscores.sort_custom(func(a, b):
+		if a["level"] != b["level"]:
+			return a["level"] > b["level"]
+		if a.get("wave", 0) != b.get("wave", 0):
+			return a.get("wave", 0) > b.get("wave", 0)
+		if a.get("kills", 0) != b.get("kills", 0):
+			return a.get("kills", 0) > b.get("kills", 0)
+		return a.get("time", 0) < b.get("time", 0)
+	)
+
+func _save_highscores_server() -> void:
+	var f := FileAccess.open(HS_FILE, FileAccess.WRITE)
+	if f != null:
+		f.store_string(JSON.stringify(highscores))
+		f.close()
+
+func _load_highscores_server() -> void:
+	if not FileAccess.file_exists(HS_FILE):
+		return
+	var f := FileAccess.open(HS_FILE, FileAccess.READ)
+	if f == null:
+		return
+	var parsed = JSON.parse_string(f.get_as_text())
+	f.close()
+	if parsed is Array:
+		highscores = parsed
+		_sort_highscores()
+
+func _sanitize_name(pname: String) -> String:
+	var s := pname.strip_edges()
+	if s.is_empty():
+		s = "Pilot"
+	return s.substr(0, 18)
+
+# ============================================================
+# Networking — client
+# ============================================================
+
+func _start_client() -> void:
+	# The server may be given as a hostname (e.g. the nginx-proxied domain
+	# sternenflucht.it-en.ch) — ENet needs a numeric IP, so resolve it first.
+	var addr := net_server_ip
+	if not addr.is_valid_ip_address():
+		var resolved := IP.resolve_hostname(addr, IP.TYPE_IPV4)
+		if resolved.is_empty():
+			resolved = IP.resolve_hostname(addr, IP.TYPE_ANY)
+		if not resolved.is_empty():
+			print("[MP] %s -> %s" % [addr, resolved])
+			addr = resolved
+		else:
+			push_error("[MP] Konnte Hostname nicht aufloesen: %s" % addr)
+	var peer := ENetMultiplayerPeer.new()
+	var err := peer.create_client(addr, NET_PORT)
+	if err != OK:
+		push_error("[MP] create_client fehlgeschlagen: %d" % err)
+		return
+	multiplayer.multiplayer_peer = peer
+	print("[MP] Verbinde zu %s:%d ..." % [addr, NET_PORT])
+
+# Connect the client multiplayer signals exactly once (the home-screen probe and a
+# real co-op join both call _start_client, and signals live on the MultiplayerAPI,
+# not the peer — so they must not be re-connected each time).
+func _setup_net_signals() -> void:
+	if not multiplayer.connected_to_server.is_connected(_on_connected_to_server):
+		multiplayer.connected_to_server.connect(_on_connected_to_server)
+	if not multiplayer.connection_failed.is_connected(_on_connection_failed):
+		multiplayer.connection_failed.connect(_on_connection_failed)
+	if not multiplayer.server_disconnected.is_connected(_on_server_disconnected):
+		multiplayer.server_disconnected.connect(_on_server_disconnected)
+
+func _on_connected_to_server() -> void:
+	net_connected = true
+	print("[MP] Verbunden als Spieler %d" % multiplayer.get_unique_id())
+	# Announce our name (drives the roster) and pull the current board + roster.
+	set_player_name.rpc_id(1, player_name)
+	request_highscores.rpc_id(1)
+	request_roster.rpc_id(1)
+	if home_probing:
+		# Status probe only: stay protected and disconnect again shortly once the
+		# roster + board have arrived. We never render the streamed world here.
+		notify_busy.rpc_id(1, true)
+		probe_timer = 0.8
+	else:
+		# Real join: announce our ship design and pull everyone else's so we can
+		# build their custom ships as their snapshots arrive.
+		submit_ship_design.rpc_id(1, ship_design)
+		request_ship_designs.rpc_id(1)
+
+func _on_connection_failed() -> void:
+	net_connected = false
+	push_error("[MP] Verbindung zum Server fehlgeschlagen")
+	if home_probing:
+		_home_probe_finish()
+
+func _on_server_disconnected() -> void:
+	net_connected = false
+	if home_probing:
+		_home_probe_finish()
+		return
+	for id in remote_players.keys():
+		remote_players[id]["node"].queue_free()
+	remote_players.clear()
+	cl_designs.clear()
+	net_roster.clear()
+	if menu_open:
+		_refresh_esc_lists()
+	print("[MP] Server-Verbindung verloren")
+
+# Server pushes the current online roster (id -> {name, level}).
+@rpc("authority", "call_remote", "reliable")
+func receive_roster(roster: Dictionary) -> void:
+	if net_mode != NetMode.CLIENT:
+		return
+	net_roster = roster
+	if menu_open:
+		_refresh_esc_lists()
+	if home_probing and home_status_label != null:
+		var others: int = maxi(0, net_roster.size() - 1)
+		home_status_label.text = "● Server online  —  %d %s" % [others, "Spieler" if others != 1 else "Spieler"]
+
+# Server pushes every player's ship design (id -> design). We store them and, for
+# any remote ship already on screen, rebuild it so the new look applies live.
+# Ships not yet visible are built from cl_designs when their snapshot first arrives.
+@rpc("authority", "call_remote", "reliable")
+func receive_ship_designs(designs: Dictionary) -> void:
+	if net_mode != NetMode.CLIENT or home_probing:
+		return
+	var my_id := multiplayer.get_unique_id()
+	for key in designs:
+		var id: int = int(key)
+		if id == my_id:
+			continue   # our own ship is the local p_node, not a remote mirror
+		cl_designs[id] = designs[key]
+		if remote_players.has(id):
+			_rebuild_remote_player(id)
+
+# Free a remote player's ship node and rebuild it from its current cl_designs entry,
+# preserving the node's transform so it doesn't visibly jump.
+func _rebuild_remote_player(id: int) -> void:
+	if not remote_players.has(id):
+		return
+	var rp: Dictionary = remote_players[id]
+	var pos: Vector3 = rp.get("tpos", Vector3.ZERO)
+	var rot: Vector3 = Vector3.ZERO
+	var old = rp.get("node")
+	if old != null:
+		pos = old.position
+		rot = old.rotation
+		old.queue_free()
+	var node := _build_ship_visual(cl_designs.get(id, DEFAULT_SHIP_DESIGN))
+	world.add_child(node)
+	node.position = pos
+	node.rotation = rot
+	rp["node"] = node
+
+# Server pushes the current highscore board (already sorted).
+@rpc("authority", "call_remote", "reliable")
+func receive_highscores(list: Array) -> void:
+	if net_mode != NetMode.CLIENT:
+		return
+	highscores = list
+	if menu_open:
+		_refresh_esc_lists()
+	if go_panel != null and go_panel.visible:
+		_refresh_go_board()
+	if home_panel != null and home_panel.visible:
+		_refresh_home_board()
+
+# Server reliably announces a new enemy with its full DNA so the client can
+# rebuild the exact procedural mesh; positions then stream in receive_world.
+@rpc("authority", "call_remote", "reliable")
+func spawn_enemy(net_id: int, dna: Dictionary, pos: Vector3) -> void:
+	if net_mode != NetMode.CLIENT or home_probing:
+		return
+	if cl_enemies.has(net_id):
+		return
+	var e := Entity.new()
+	e.type = dna.get("role", "drone")
+	e.net_id = net_id
+	e.pos = pos
+	e.tpos = pos
+	e.node = _build_procedural_enemy(dna)
+	e.node.position = pos
+	world.add_child(e.node)
+	cl_enemies[net_id] = e
+	enemies.append(e)
+
+@rpc("authority", "call_remote", "reliable")
+func despawn_enemy(net_id: int) -> void:
+	if net_mode != NetMode.CLIENT or not cl_enemies.has(net_id):
+		return
+	var e: Entity = cl_enemies[net_id]
+	if e.node != null:
+		e.node.queue_free()
+	e.dead = true
+	cl_enemies.erase(net_id)
+	enemies.erase(e)
+
+# Server tells one specific client it took damage (the client owns its own HP,
+# i-frames and death/respawn).
+@rpc("authority", "call_remote", "reliable")
+func hit_player(dmg: int) -> void:
+	if net_mode != NetMode.CLIENT:
+		return
+	if p_invuln_timer > 0.0:
+		return
+	_player_take_damage(dmg)
+
+# Server tells one client it picked up a gem.
+@rpc("authority", "call_remote", "reliable")
+func grant_xp(value: int) -> void:
+	if net_mode != NetMode.CLIENT:
+		return
+	p_xp += value
+	_check_level_up()
+
+# The full per-tick world snapshot. Players + enemy positions are updated for
+# known ids; bullets and gems are created on first sight and removed when absent.
+@rpc("authority", "call_remote", "unreliable")
+func receive_world(snap: Dictionary) -> void:
+	if net_mode != NetMode.CLIENT or home_probing:
+		return
+	_apply_players(snap.get("pid", PackedInt32Array()), snap.get("ppos", PackedVector2Array()), snap.get("pyaw", PackedFloat32Array()), snap.get("pwave", PackedInt32Array()), snap.get("pkills", PackedInt32Array()))
+	_apply_enemy_positions(snap.get("eid", PackedInt32Array()), snap.get("epos", PackedVector2Array()))
+	_apply_gems(snap.get("gid", PackedInt32Array()), snap.get("gpos", PackedVector2Array()))
+
+# Bullets stream in their own unreliable packet (see _server_broadcast).
+@rpc("authority", "call_remote", "unreliable")
+func receive_bullets(snap: Dictionary) -> void:
+	if net_mode != NetMode.CLIENT or home_probing:
+		return
+	_apply_bullets(snap.get("pbid", PackedInt32Array()), snap.get("pbpos", PackedVector2Array()), snap.get("pbvel", PackedVector2Array()), cl_pbullets, p_bullets, true)
+	_apply_bullets(snap.get("ebid", PackedInt32Array()), snap.get("ebpos", PackedVector2Array()), snap.get("ebvel", PackedVector2Array()), cl_ebullets, e_bullets, false)
+
+func _apply_players(ids: PackedInt32Array, posv: PackedVector2Array, yawv: PackedFloat32Array, wavev: PackedInt32Array, killsv: PackedInt32Array) -> void:
+	var my_id := multiplayer.get_unique_id()
+	var seen := {}
+	for i in ids.size():
+		var id: int = ids[i]
+		if id == my_id:
+			# The server owns our wave + kill count — mirror them for HUD + score.
+			if i < wavev.size():
+				wave = wavev[i]
+			if i < killsv.size():
+				kills = killsv[i]
+			continue
+		seen[id] = true
+		var pos: Vector3 = Vector3(posv[i].x, posv[i].y, 0)
+		var yaw: float = yawv[i]
+		if not remote_players.has(id):
+			var node := _build_ship_visual(cl_designs.get(id, DEFAULT_SHIP_DESIGN))
+			world.add_child(node)
+			node.position = pos
+			node.rotation = Vector3(0, 0, yaw)
+			remote_players[id] = {"node": node, "tpos": pos, "tyaw": yaw}
+			print("[MP] Mitspieler erschienen: %d  (sichtbar: %d)" % [id, remote_players.size()])
+		else:
+			remote_players[id]["tpos"] = pos
+			remote_players[id]["tyaw"] = yaw
+	for id in remote_players.keys():
+		if not seen.has(id):
+			remote_players[id]["node"].queue_free()
+			remote_players.erase(id)
+			cl_designs.erase(id)
+			print("[MP] Mitspieler verschwunden: %d  (sichtbar: %d)" % [int(id), remote_players.size()])
+
+func _apply_enemy_positions(ids: PackedInt32Array, posv: PackedVector2Array) -> void:
+	for i in ids.size():
+		var net_id: int = ids[i]
+		if cl_enemies.has(net_id):
+			cl_enemies[net_id].tpos = Vector3(posv[i].x, posv[i].y, 0)
+
+func _apply_bullets(ids: PackedInt32Array, posv: PackedVector2Array, velv: PackedVector2Array, dict: Dictionary, arr: Array, is_player: bool) -> void:
+	var seen := {}
+	for i in ids.size():
+		var net_id: int = ids[i]
+		seen[net_id] = true
+		var bp: Vector2 = posv[i]
+		var bv: Vector2 = velv[i]
+		if dict.has(net_id):
+			var b: Entity = dict[net_id]
+			b.pos = Vector3(bp.x, bp.y, 0)
+			b.vel = Vector3(bv.x, bv.y, 0)
+		else:
+			var b := Entity.new()
+			b.type = "p_bullet" if is_player else "e_bullet"
+			b.net_id = net_id
+			b.pos = Vector3(bp.x, bp.y, 0)
+			b.vel = Vector3(bv.x, bv.y, 0)
+			b.node = _make_player_laser_mesh(b.vel) if is_player else _make_bullet_mesh(false)
+			b.node.position = b.pos
+			world.add_child(b.node)
+			dict[net_id] = b
+			arr.append(b)
+	for net_id in dict.keys():
+		if not seen.has(net_id):
+			var b: Entity = dict[net_id]
+			if b.node != null:
+				b.node.queue_free()
+			dict.erase(net_id)
+			arr.erase(b)
+
+func _apply_gems(ids: PackedInt32Array, posv: PackedVector2Array) -> void:
+	var seen := {}
+	for i in ids.size():
+		var net_id: int = ids[i]
+		seen[net_id] = true
+		var pos: Vector3 = Vector3(posv[i].x, posv[i].y, 0)
+		if cl_gems.has(net_id):
+			cl_gems[net_id].tpos = pos
+		else:
+			var g := Entity.new()
+			g.type = "gem"
+			g.net_id = net_id
+			g.pos = pos
+			g.tpos = pos
+			g.radius = 0.35
+			g.node = _make_gem_mesh()
+			g.node.position = pos
+			world.add_child(g.node)
+			cl_gems[net_id] = g
+			gems.append(g)
+	for net_id in cl_gems.keys():
+		if not seen.has(net_id):
+			var g: Entity = cl_gems[net_id]
+			if g.node != null:
+				g.node.queue_free()
+			cl_gems.erase(net_id)
+			gems.erase(g)
+
+# Per-frame client networking: send my transform, then smoothly interpolate every
+# remote thing toward its latest snapshot value.
+func _client_net_update(delta: float) -> void:
+	if net_connected:
+		net_send_accum += delta
+		if net_send_accum >= NET_TICK:
+			net_send_accum = 0.0
+			submit_player_state.rpc_id(1, p_pos, atan2(p_facing.y, p_facing.x), p_level)
+	# Remote player ships
+	for id in remote_players:
+		var r: Dictionary = remote_players[id]
+		var n: Node3D = r["node"]
+		n.position = n.position.lerp(r["tpos"], clamp(delta * 12.0, 0.0, 1.0))
+		var nz: float = lerp_angle(n.rotation.z, r["tyaw"], clamp(delta * 12.0, 0.0, 1.0))
+		n.rotation = Vector3(0, 0, nz)
+	# Enemies — lerp toward snapshot position; keep e.pos current for aim/radar.
+	for net_id in cl_enemies:
+		var e: Entity = cl_enemies[net_id]
+		e.pos = e.pos.lerp(e.tpos, clamp(delta * 12.0, 0.0, 1.0))
+		if e.node != null:
+			e.node.position = e.pos
+	# Bullets — extrapolate by velocity between the 20 Hz snapshots so they glide.
+	for net_id in cl_pbullets:
+		var b: Entity = cl_pbullets[net_id]
+		b.pos += b.vel * delta
+		if b.node != null:
+			b.node.position = b.pos
+	for net_id in cl_ebullets:
+		var b: Entity = cl_ebullets[net_id]
+		b.pos += b.vel * delta
+		if b.node != null:
+			b.node.position = b.pos
+	# Gems — lerp + the same idle spin/pulse the single-player gems have.
+	for net_id in cl_gems:
+		var g: Entity = cl_gems[net_id]
+		g.pos = g.pos.lerp(g.tpos, clamp(delta * 12.0, 0.0, 1.0))
+		g.pulse += delta
+		if g.node != null:
+			g.node.position = g.pos
+			g.node.rotation.z = g.pulse * 4.0
+			var s: float = 0.9 + sin(g.pulse * 6.0) * 0.12
+			g.node.scale = Vector3(s, s, s)
+
+# Standalone copy of the player ship for a remote co-op player. Reuses the exact
+# geometry of _assemble_ship_body() by temporarily redirecting the member vars it
+# writes, then restoring them so the local player's ship is untouched.
+func _build_ship_visual(design: Dictionary = DEFAULT_SHIP_DESIGN) -> Node3D:
+	var root := Node3D.new()
+	root.scale = Vector3.ONE * SHIP_SCALE_BASE
+	var sr := Node3D.new()
+	sr.rotation_degrees = Vector3(90, 0, 0)
+	root.add_child(sr)
+
+	var s_render := ship_render
+	var s_pulse := p_pulse_lights
+	var s_ep := p_engine_mat_port
+	var s_es := p_engine_mat_starboard
+	var s_eg := p_engine_glow
+	var s_egm := p_engine_glow_mat
+	var s_bf := p_boost_flame
+	var s_bfm := p_boost_flame_mat
+	# Remote ships are built from the peer's synced design. Swap the member around
+	# the build (which reads ship_design) so it doesn't clobber our own design.
+	var s_design := ship_design
+	ship_design = design
+
+	ship_render = sr
+	p_pulse_lights = []   # throwaway — remote ships glow but don't pulse-animate
+	_assemble_ship_body()
+
+	ship_design = s_design
+	ship_render = s_render
+	p_pulse_lights = s_pulse
+	p_engine_mat_port = s_ep
+	p_engine_mat_starboard = s_es
+	p_engine_glow = s_eg
+	p_engine_glow_mat = s_egm
+	p_boost_flame = s_bf
+	p_boost_flame_mat = s_bfm
+	return root
 
 func _build_audio() -> void:
 	# Procedural laser zap — descending frequency, exponential decay envelope.
@@ -756,9 +1790,25 @@ func _make_enemy_shot_sound() -> AudioStreamWAV:
 	return stream
 
 func _process(delta: float) -> void:
-	# Mute all audio while not actively in gameplay (level-up panel, pause, game over).
-	AudioServer.set_bus_mute(0, state != STATE_PLAYING or pause)
-	if state != STATE_PLAYING or pause:
+	# Dedicated server: only the authoritative netcode runs, nothing visual.
+	if net_mode == NetMode.SERVER:
+		_server_process(delta)
+		return
+	# Home / start screen + ship-builder: no gameplay, just the ambient world +
+	# the ship turntable (the editor reuses the home framing).
+	if state == STATE_HOME or state == STATE_SHIPYARD:
+		AudioServer.set_bus_mute(0, true)
+		_home_update(delta)
+		return
+	# Co-op clients keep the world live during their own menus (level-up OR the ESC
+	# self-pause): the server keeps simulating and keeps the player invulnerable, so we
+	# only freeze their own ship. Single-player menus fully freeze the world.
+	var coop_live := net_mode == NetMode.CLIENT and (state == STATE_LEVELUP or menu_open) and state != STATE_GAMEOVER
+	var local_menu := menu_open or state == STATE_LEVELUP   # this player's own ship/fire frozen
+	var hard_stop := (state != STATE_PLAYING or menu_open) and not coop_live
+	# Mute all audio while not actively in gameplay (menu fully freezes us; game over).
+	AudioServer.set_bus_mute(0, hard_stop)
+	if hard_stop:
 		_update_ui_text()
 		_animate_background(delta * 0.3)
 		if radar != null:
@@ -766,17 +1816,28 @@ func _process(delta: float) -> void:
 		return
 
 	run_time += delta
-	_update_player(delta)
-	_update_enemies(delta)
-	_update_p_bullets(delta)
-	_update_e_bullets(delta)
-	_update_gems(delta)
-	_update_fire(delta)
-	_update_spawning(delta)
-	_update_wave(delta)
-	_resolve_collisions()
-	_purge_dead()
-	_check_lightning_strikes(delta)
+	if net_mode == NetMode.CLIENT:
+		# Co-op client: the server owns enemies, bullets, gems, waves and damage.
+		# The client only drives its own ship + firing, then renders the snapshot.
+		# While a menu is open the world keeps streaming, but the player's own
+		# ship/fire/lightning are frozen (and the server keeps them invulnerable).
+		if not local_menu:
+			_update_player(delta)
+			_update_fire(delta)
+			_check_lightning_strikes(delta)
+		_client_net_update(delta)
+	else:
+		_update_player(delta)
+		_update_enemies(delta)
+		_update_p_bullets(delta)
+		_update_e_bullets(delta)
+		_update_gems(delta)
+		_update_fire(delta)
+		_update_spawning(delta)
+		_update_wave(delta)
+		_resolve_collisions()
+		_purge_dead()
+		_check_lightning_strikes(delta)
 	_update_shake(delta)
 	_animate_background(delta)
 	_animate_ship_lights(delta)
@@ -788,12 +1849,21 @@ func _process(delta: float) -> void:
 		radar.queue_redraw()
 
 func _unhandled_input(event: InputEvent) -> void:
+	if net_mode == NetMode.SERVER:
+		return
+	# ESC opens/closes the self-pause + server screen. (Spacebar no longer pauses.)
 	if event.is_action_pressed("pause"):
 		if state == STATE_GAMEOVER:
-			_restart_run()
 			return
-		pause = not pause
-		lbl_pause.visible = pause
+		if state == STATE_SHIPYARD:
+			# ESC in the hangar = discard changes and go back to the home screen.
+			_shipyard_cancel()
+			return
+		if settings_panel != null and settings_panel.visible:
+			# ESC backs out of the settings sub-panel first.
+			_close_settings()
+			return
+		_toggle_esc_menu()
 
 # ============================================================
 # Environment / lighting / camera
@@ -1655,18 +2725,34 @@ func _build_player() -> void:
 	ship_render.rotation_degrees = Vector3(90, 0, 0)
 	p_node.add_child(ship_render)
 	# (Everything else attaches to ship_render, not p_node.)
+	_assemble_ship_body()
+
+# Builds all ship meshes + lights into the member `ship_render` and registers
+# pulse-light / engine / boost materials on member vars. Split out of
+# _build_player so a standalone copy can be made for remote co-op players via
+# _build_ship_visual() without duplicating the ~650-line geometry.
+func _assemble_ship_body() -> void:
+	# Resolve the cosmetic palette from the current ship_design. The four base
+	# colours (hull / accent / glow / engine) drive every painted material below;
+	# the "Tarnung" palette (index 0) reproduces the original stealth-fighter look.
+	var _pal_idx: int = clampi(int(ship_design.get("palette", 0)), 0, SHIP_PALETTES.size() - 1)
+	var pal: Dictionary = SHIP_PALETTES[_pal_idx]
+	var pal_hull: Color = pal["hull"]
+	var pal_accent: Color = pal["accent"]
+	var pal_glow: Color = pal["glow"]
+	var pal_engine: Color = pal["engine"]
 
 	# ===== Materials =====
 	# Stealth-paint hull — desaturated slate-blue, clearcoat over metallic
 	# base, mimics F-22 RAM coating. Emission stays low so external lights
 	# (planets, projectiles) drive the look.
 	var mat_hull := StandardMaterial3D.new()
-	mat_hull.albedo_color = Color(0.22, 0.27, 0.36)
+	mat_hull.albedo_color = pal_hull
 	mat_hull.metallic = 0.5
 	mat_hull.roughness = 0.32
 	mat_hull.metallic_specular = 0.55
 	mat_hull.emission_enabled = true
-	mat_hull.emission = Color(0.04, 0.08, 0.16)
+	mat_hull.emission = pal_hull * 0.45
 	mat_hull.emission_energy_multiplier = 0.10
 	mat_hull.rim_enabled = true
 	mat_hull.rim = 0.6
@@ -1677,11 +2763,11 @@ func _build_player() -> void:
 
 	# Accent panel — lighter steel-blue, used for spine, vertical-stab edges
 	var mat_accent := StandardMaterial3D.new()
-	mat_accent.albedo_color = Color(0.42, 0.55, 0.78)
+	mat_accent.albedo_color = pal_accent
 	mat_accent.metallic = 0.85
 	mat_accent.roughness = 0.24
 	mat_accent.emission_enabled = true
-	mat_accent.emission = Color(0.18, 0.36, 0.7)
+	mat_accent.emission = pal_accent * 0.5
 	mat_accent.emission_energy_multiplier = 0.22
 	mat_accent.rim_enabled = true
 	mat_accent.rim = 0.45
@@ -1728,9 +2814,9 @@ func _build_player() -> void:
 
 	# Cyan glowing strip — wing leading edges, intake lips, accent seams
 	var mat_panel_glow := StandardMaterial3D.new()
-	mat_panel_glow.albedo_color = Color(0.55, 0.92, 1.0)
+	mat_panel_glow.albedo_color = pal_glow.lightened(0.3)
 	mat_panel_glow.emission_enabled = true
-	mat_panel_glow.emission = Color(0.35, 0.8, 1.0)
+	mat_panel_glow.emission = pal_glow
 	mat_panel_glow.emission_energy_multiplier = 2.6
 	mat_panel_glow.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 
@@ -1860,9 +2946,9 @@ func _build_player() -> void:
 
 	# Cockpit interior glow — pilot HUD strip
 	var console_mat := StandardMaterial3D.new()
-	console_mat.albedo_color = Color(0.3, 0.95, 1.0)
+	console_mat.albedo_color = pal_glow
 	console_mat.emission_enabled = true
-	console_mat.emission = Color(0.3, 0.95, 1.0)
+	console_mat.emission = pal_glow
 	console_mat.emission_energy_multiplier = 3.0
 	console_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	var console := MeshInstance3D.new()
@@ -1912,13 +2998,29 @@ func _build_player() -> void:
 	#                          WINGS (swept delta, aggressive)
 	# ============================================================
 	# Sharper, shorter, more aggressively swept wings for a sporty look.
-	for sign_v in [-1, 1]:
+	# Wing shape is design-driven (ship_design.wings): chord/span/sweep vary per
+	# option; "none" yields an empty side list so the loop builds nothing.
+	var wkind: String = str(ship_design.get("wings", "swept"))
+	var w_chord: float = 0.55
+	var w_span: float = 0.68
+	var w_le_sweep: float = 42.0
+	match wkind:
+		"delta":
+			w_chord = 0.72; w_span = 0.52; w_le_sweep = 30.0
+		"long":
+			w_chord = 0.46; w_span = 0.95; w_le_sweep = 48.0
+	var w_span_ratio: float = w_span / 0.68   # scales tip/edge/pylon offsets with span
+	var wing_sides: Array = [] if wkind == "none" else [-1, 1]
+	for sign_v in wing_sides:
 		var wing := MeshInstance3D.new()
 		var wm := PrismMesh.new()
-		# Root chord 0.55, tip extends 0.68 outward, thickness 0.05
-		wm.size = Vector3(0.55, 0.68, 0.05); wm.material = mat_hull
+		# Root chord / span are design-driven; thickness fixed at 0.05
+		wm.size = Vector3(w_chord, w_span, 0.05); wm.material = mat_hull
 		wing.mesh = wm
-		wing.rotation_degrees = Vector3(-90, sign_v * 90, 0)
+		# Starboard must be the exact Z-mirror of port. The z=0 mirror of a YXZ
+		# Euler(rx,ry,rz) is Euler(-rx,-ry,rz), so BOTH the X and Y angle flip sign
+		# per side. (Previously only Y flipped → the right wing came out twisted.)
+		wing.rotation_degrees = Vector3(sign_v * 90, sign_v * 90, 0)
 		wing.position = Vector3(-0.10, -0.04, sign_v * 0.40)
 		ship_render.add_child(wing)
 		# Leading-edge glow along the swept edge
@@ -1926,8 +3028,8 @@ func _build_player() -> void:
 		var lem := BoxMesh.new()
 		lem.size = Vector3(0.50, 0.020, 0.025); lem.material = mat_panel_glow
 		le.mesh = lem
-		le.position = Vector3(0.02, -0.02, sign_v * 0.55)
-		le.rotation_degrees = Vector3(0, sign_v * 42, 0)  # steeper sweep
+		le.position = Vector3(0.02, -0.02, sign_v * 0.55 * w_span_ratio)
+		le.rotation_degrees = Vector3(0, sign_v * w_le_sweep, 0)  # design-driven sweep
 		ship_render.add_child(le)
 		# Wing-tip navigation light (port red / starboard green)
 		var tip := MeshInstance3D.new()
@@ -1942,7 +3044,7 @@ func _build_player() -> void:
 		tmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 		tm.material = tmat
 		tip.mesh = tm
-		tip.position = Vector3(-0.40, -0.03, sign_v * 0.92)
+		tip.position = Vector3(-0.40, -0.03, sign_v * 0.92 * w_span_ratio)
 		ship_render.add_child(tip)
 		p_pulse_lights.append({"mat": tmat, "base": 4.0, "amp": 3.5, "freq": 1.8,
 			"phase": (0.0 if sign_v > 0 else PI)})
@@ -1951,7 +3053,7 @@ func _build_player() -> void:
 		var pym := BoxMesh.new()
 		pym.size = Vector3(0.14, 0.04, 0.05); pym.material = mat_dark
 		pylon.mesh = pym
-		pylon.position = Vector3(-0.05, -0.08, sign_v * 0.58)
+		pylon.position = Vector3(-0.05, -0.08, sign_v * 0.58 * w_span_ratio)
 		ship_render.add_child(pylon)
 
 	# ============================================================
@@ -1997,9 +3099,9 @@ func _build_player() -> void:
 
 	# Port (left from cockpit pov; z = -0.14 in airplane frame)
 	p_engine_mat_port = StandardMaterial3D.new()
-	p_engine_mat_port.albedo_color = Color(0.55, 0.85, 1.0)
+	p_engine_mat_port.albedo_color = pal_engine
 	p_engine_mat_port.emission_enabled = true
-	p_engine_mat_port.emission = Color(0.55, 0.85, 1.0)
+	p_engine_mat_port.emission = pal_engine
 	p_engine_mat_port.emission_energy_multiplier = 5.5
 	p_engine_mat_port.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	var eg_port := MeshInstance3D.new()
@@ -2013,9 +3115,9 @@ func _build_player() -> void:
 
 	# Starboard (right; z = +0.14)
 	p_engine_mat_starboard = StandardMaterial3D.new()
-	p_engine_mat_starboard.albedo_color = Color(0.55, 0.85, 1.0)
+	p_engine_mat_starboard.albedo_color = pal_engine
 	p_engine_mat_starboard.emission_enabled = true
-	p_engine_mat_starboard.emission = Color(0.55, 0.85, 1.0)
+	p_engine_mat_starboard.emission = pal_engine
 	p_engine_mat_starboard.emission_energy_multiplier = 5.5
 	p_engine_mat_starboard.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	var eg_starboard := MeshInstance3D.new()
@@ -2030,12 +3132,6 @@ func _build_player() -> void:
 	p_engine_glow = eg_starboard
 	p_engine_glow_mat = p_engine_mat_starboard
 
-	# Debug: confirm both materials are distinct instances and added to scene
-	print("[engines] port mat id=", p_engine_mat_port.get_instance_id(),
-		" starboard mat id=", p_engine_mat_starboard.get_instance_id(),
-		" port glow in tree=", eg_port.is_inside_tree(),
-		" starboard glow in tree=", eg_starboard.is_inside_tree())
-
 	# Boost flame container — twin flames, scale-driven length, shared material.
 	# Container is anchored EXACTLY at the nozzle exit (-0.88 X). Each capsule
 	# is offset rearward by half its mesh length so its front cap lands on the
@@ -2048,10 +3144,12 @@ func _build_player() -> void:
 	p_boost_flame.visible = false
 	ship_render.add_child(p_boost_flame)
 	var bfmat := StandardMaterial3D.new()
-	bfmat.albedo_color = Color(0.7, 0.95, 1.0, 0.85)
+	var bf_albedo: Color = pal_engine.lightened(0.3)
+	bf_albedo.a = 0.85
+	bfmat.albedo_color = bf_albedo
 	bfmat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	bfmat.emission_enabled = true
-	bfmat.emission = Color(0.55, 0.85, 1.0)
+	bfmat.emission = pal_engine
 	bfmat.emission_energy_multiplier = 6.0
 	bfmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	bfmat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
@@ -2424,14 +3522,14 @@ func _update_enemies(delta: float) -> void:
 		e.hit_flash = max(0.0, e.hit_flash - delta * 4.0)
 		match e.type:
 			"drone":
-				_ai_chase(e, delta, 5.0)
+				_ai_chase(e, delta, 5.0, p_pos)
 			"shooter":
-				_ai_keep_distance(e, delta, 4.2, 11.0)
-				_ai_shoot(e, delta, 8, 9.5)
+				_ai_keep_distance(e, delta, 4.2, 11.0, p_pos)
+				_ai_shoot(e, delta, 8, 9.5, p_pos)
 			"tank":
-				_ai_chase(e, delta, 2.8)
+				_ai_chase(e, delta, 2.8, p_pos)
 			"boss":
-				_ai_boss(e, delta)
+				_ai_boss(e, delta, p_pos)
 		e.pos += e.vel * delta
 		_clamp_to_arena(e)
 		if e.node != null:
@@ -2449,41 +3547,41 @@ func _clamp_to_arena(e: Entity) -> void:
 	# Open space — enemies follow player, no hard arena boundaries
 	pass
 
-func _ai_chase(e: Entity, delta: float, speed: float) -> void:
-	var to_p: Vector3 = p_pos - e.pos
+func _ai_chase(e: Entity, delta: float, speed: float, target: Vector3) -> void:
+	var to_p: Vector3 = target - e.pos
 	var d: float = to_p.length()
 	if d > 0.01:
 		e.vel = e.vel.lerp(to_p / d * speed, clamp(delta * 4.0, 0.0, 1.0))
 
-func _ai_keep_distance(e: Entity, delta: float, speed: float, ideal: float) -> void:
-	var to_p: Vector3 = p_pos - e.pos
+func _ai_keep_distance(e: Entity, delta: float, speed: float, ideal: float, target: Vector3) -> void:
+	var to_p: Vector3 = target - e.pos
 	var d: float = to_p.length()
 	if d < 0.01:
 		return
 	var dir: Vector3 = to_p / d
-	var target: Vector3 = dir * speed
+	var target_vel: Vector3 = dir * speed
 	if d < ideal - 1.2:
-		target = -dir * speed
+		target_vel = -dir * speed
 	elif d <= ideal + 1.2:
 		# Strafe perpendicular (in XY plane)
-		target = Vector3(-dir.y, dir.x, 0) * speed * 0.7
-	e.vel = e.vel.lerp(target, clamp(delta * 3.5, 0.0, 1.0))
+		target_vel = Vector3(-dir.y, dir.x, 0) * speed * 0.7
+	e.vel = e.vel.lerp(target_vel, clamp(delta * 3.5, 0.0, 1.0))
 
-func _ai_shoot(e: Entity, delta: float, dmg: int, bullet_speed: float) -> void:
+func _ai_shoot(e: Entity, delta: float, dmg: int, bullet_speed: float, target: Vector3) -> void:
 	e.shoot_timer -= delta
 	if e.shoot_timer > 0.0:
 		return
 	e.shoot_timer = e.shoot_cd
-	var dir: Vector3 = (p_pos - e.pos).normalized()
+	var dir: Vector3 = (target - e.pos).normalized()
 	_spawn_e_bullet(e.pos, dir * bullet_speed, dmg)
 
-func _ai_boss(e: Entity, delta: float) -> void:
-	_ai_keep_distance(e, delta, 3.2, 10.0)
+func _ai_boss(e: Entity, delta: float, target: Vector3) -> void:
+	_ai_keep_distance(e, delta, 3.2, 10.0, target)
 	e.shoot_timer -= delta
 	if e.shoot_timer > 0.0:
 		return
 	e.shoot_timer = e.shoot_cd
-	var base: Vector3 = (p_pos - e.pos).normalized()
+	var base: Vector3 = (target - e.pos).normalized()
 	var base_a: float = atan2(base.y, base.x)
 	for i in range(-1, 2):
 		var a: float = base_a + deg_to_rad(i * 14.0)
@@ -2568,29 +3666,44 @@ func _alive_enemy_count() -> int:
 			n += 1
 	return n
 
-func _spawn_wave_enemy() -> void:
+# Difficulty tier driving enemy composition: the local player's level in
+# single-player, the highest connected player's level on a co-op server.
+func _party_level() -> int:
+	if net_mode == NetMode.SERVER:
+		var m := 1
+		for id in net_states:
+			m = maxi(m, int(net_states[id].get("level", 1)))
+		return m
+	return p_level
+
+# Shared enemy-role roll: tougher roles unlock by party level, not elapsed waves.
+func _pick_enemy_kind(lvl: int = -1) -> String:
+	if lvl < 0:
+		lvl = _party_level()   # single-player / fallback
 	var pick := randf()
-	var kind: String
-	if wave >= 3 and pick < 0.08:
-		kind = "tank"
-	elif wave >= 2 and pick < 0.32:
-		kind = "shooter"
-	else:
-		kind = "drone"
-	_spawn_enemy(kind, _ring_pos(SPAWN_RING * u_range_mult))
+	if lvl >= TANK_MIN_LEVEL and pick < 0.08:
+		return "tank"
+	elif lvl >= SHOOTER_MIN_LEVEL and pick < 0.32:
+		return "shooter"
+	return "drone"
+
+func _spawn_wave_enemy() -> void:
+	_spawn_enemy(_pick_enemy_kind(), _ring_pos(SPAWN_RING * u_range_mult))
 
 func _ring_pos(radius: float) -> Vector3:
 	# Spawn around player in open space (no arena clamps)
 	var ang: float = randf() * TAU
 	return p_pos + Vector3(cos(ang), sin(ang), 0) * radius
 
-func _spawn_enemy(kind: String, pos: Vector3) -> void:
+func _spawn_enemy(kind: String, pos: Vector3, wave_n: int = -1) -> void:
 	var e := Entity.new()
 	e.type = kind
 	e.pos = pos
-	var wave_scale: float = 1.0 + (wave - 1) * 0.18
+	# Per-player wave on the server (passed in), global wave in single-player.
+	var wn: int = wave_n if wave_n >= 0 else wave
+	var wave_scale: float = 1.0 + (wn - 1) * 0.18
 	# Generate procedural DNA — gives variety even within same role
-	var dna := _generate_enemy_dna(kind, wave)
+	var dna := _generate_enemy_dna(kind, wn)
 	var size: float = dna["size_mult"]
 	match kind:
 		"drone":
@@ -2604,9 +3717,17 @@ func _spawn_enemy(kind: String, pos: Vector3) -> void:
 			e.hp = int(round(20 * wave_scale)); e.max_hp = e.hp
 			e.radius = 0.95 * size / 1.05; e.damage = 22; e.value = 8
 		"boss":
-			e.hp = int(round(150 + wave * 25)); e.max_hp = e.hp
+			e.hp = int(round(150 + wn * 25)); e.max_hp = e.hp
 			e.radius = 1.5 * size / 1.7; e.damage = 25; e.value = 50
 			e.shoot_cd = 1.0; e.shoot_timer = 1.0
+	e.dna = dna
+	# Server: headless authority — assign a network id and tell clients to build
+	# the mesh from the DNA, but build nothing locally.
+	if net_mode == NetMode.SERVER:
+		e.net_id = _next_net_id()
+		enemies.append(e)
+		spawn_enemy.rpc(e.net_id, dna, pos)
+		return
 	e.node = _build_procedural_enemy(dna)
 	e.node.position = pos
 	world.add_child(e.node)
@@ -2624,7 +3745,20 @@ func _spawn_enemy(kind: String, pos: Vector3) -> void:
 	enemies.append(e)
 
 func _spawn_boss_wave() -> void:
-	_spawn_enemy("boss", _ring_pos(SPAWN_RING * u_range_mult * 0.6))
+	var radius: float = SPAWN_RING * u_range_mult * 0.6
+	if net_mode == NetMode.SERVER and not net_states.is_empty():
+		# Center on an active player, never one whose level-up menu is open.
+		var ids: Array = []
+		for id in net_states:
+			if not net_states[id].get("busy", false):
+				ids.append(id)
+		if ids.is_empty():
+			ids = net_states.keys()
+		var center: Vector3 = net_states[ids[randi() % ids.size()]]["pos"]
+		var ang: float = randf() * TAU
+		_spawn_enemy("boss", center + Vector3(cos(ang), sin(ang), 0) * radius)
+	else:
+		_spawn_enemy("boss", _ring_pos(radius))
 
 func _make_enemy_mesh(kind: String) -> Node3D:
 	var root := Node3D.new()
@@ -3077,6 +4211,28 @@ const PALETTES := [
 const HULL_SHAPES := ["box", "elongated", "hex", "diamond", "sphere", "twin", "stacked"]
 const WING_TYPES := ["none", "swept", "back_swept", "delta", "x_pattern", "small_fins"]
 const WEAPON_TYPES := ["none", "single", "twin", "triple", "pod_array", "missile_rack", "turret_array", "boss_arms"]
+
+# ============================================================
+# Modular PLAYER ship design (cosmetic for now — see memory project_ship_builder).
+# Keys are JSON-safe primitives (int index / stable string ids) so the design
+# saves to settings.cfg and syncs over the net trivially. The mesh builder
+# (_assemble_ship_body) reads the member `ship_design`; the editor (STATE_SHIPYARD)
+# cycles these options and rebuilds the ship live.
+# ============================================================
+const SHIP_PALETTES := [
+	{"name": "Tarnung", "hull": Color(0.22, 0.27, 0.36), "accent": Color(0.42, 0.55, 0.78), "glow": Color(0.35, 0.80, 1.00), "engine": Color(0.55, 0.85, 1.00)},
+	{"name": "Inferno", "hull": Color(0.30, 0.10, 0.10), "accent": Color(0.70, 0.25, 0.15), "glow": Color(1.00, 0.45, 0.15), "engine": Color(1.00, 0.50, 0.20)},
+	{"name": "Toxisch", "hull": Color(0.16, 0.28, 0.16), "accent": Color(0.45, 0.70, 0.25), "glow": Color(0.55, 1.00, 0.30), "engine": Color(0.60, 1.00, 0.40)},
+	{"name": "Plasma", "hull": Color(0.24, 0.16, 0.34), "accent": Color(0.60, 0.40, 0.85), "glow": Color(0.80, 0.40, 1.00), "engine": Color(0.75, 0.45, 1.00)},
+	{"name": "Gold", "hull": Color(0.30, 0.24, 0.12), "accent": Color(0.80, 0.65, 0.30), "glow": Color(1.00, 0.85, 0.40), "engine": Color(1.00, 0.80, 0.45)},
+	{"name": "Arktis", "hull": Color(0.50, 0.58, 0.68), "accent": Color(0.75, 0.85, 0.95), "glow": Color(0.70, 0.95, 1.00), "engine": Color(0.80, 0.95, 1.00)},
+]
+const SHIP_WING_OPTS := ["swept", "delta", "long", "none"]
+const SHIP_WING_LABELS := {"swept": "Pfeilflügel", "delta": "Delta", "long": "Lang", "none": "Keine"}
+const DEFAULT_SHIP_DESIGN := {
+	"palette": 0,
+	"wings": "swept",
+}
 
 func _make_proc_hull_mat(c: Color) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
@@ -3562,6 +4718,10 @@ func _spawn_e_bullet(pos: Vector3, vel: Vector3, dmg: int) -> void:
 	b.radius = 0.15
 	b.damage = dmg
 	b.lifetime = 3.5
+	if net_mode == NetMode.SERVER:
+		b.net_id = _next_net_id()
+		e_bullets.append(b)
+		return
 	b.node = _make_bullet_mesh(false)
 	b.node.position = pos
 	world.add_child(b.node)
@@ -3686,6 +4846,10 @@ func _spawn_gem(pos: Vector3, value: int) -> void:
 	g.vel = Vector3(randf_range(-2, 2), randf_range(-2, 2), 0)
 	g.radius = 0.35
 	g.value = value
+	if net_mode == NetMode.SERVER:
+		g.net_id = _next_net_id()
+		gems.append(g)
+		return
 	g.node = _make_gem_mesh()
 	g.node.position = pos
 	world.add_child(g.node)
@@ -3737,6 +4901,22 @@ func _update_fire(delta: float) -> void:
 	var n: int = u_projectiles
 	var spread: float = deg_to_rad(u_spread_deg)
 	var base_a: float = atan2(dir.y, dir.x)
+	# Client: the server owns the authoritative bullets — send a fire command with
+	# this player's stats and only render local muzzle flash + sound for feel.
+	if net_mode == NetMode.CLIENT:
+		fire_bullets.rpc_id(1, p_pos, base_a, n, u_spread_deg, u_damage, u_pierce, PROJ_LIFETIME * u_range_mult, PROJ_SPEED)
+		for i in n:
+			var ct: float = 0.5 if n == 1 else float(i) / float(n - 1)
+			var coff: float = (ct - 0.5) * spread * (1.0 if n > 1 else 0.0)
+			var ca: float = base_a + coff
+			_spawn_muzzle_flash(p_pos + Vector3(cos(ca), sin(ca), 0) * 0.8, ca)
+		if laser_sfx != null:
+			laser_sfx.play()
+			if u_projectiles > 1 and laser_sfx_echo != null:
+				get_tree().create_timer(0.035).timeout.connect(
+					func(): if laser_sfx_echo != null: laser_sfx_echo.play()
+				)
+		return
 	for i in n:
 		var t: float = 0.5 if n == 1 else float(i) / float(n - 1)
 		var off: float = (t - 0.5) * spread * (1.0 if n > 1 else 0.0)
@@ -3828,9 +5008,14 @@ func _resolve_collisions() -> void:
 				e.pos += push
 				break
 
-func _kill_enemy(e: Entity) -> void:
+func _kill_enemy(e: Entity, killer_id: int = -1) -> void:
 	e.dead = true
-	kills += 1
+	if net_mode == NetMode.SERVER:
+		# Credit the kill to the player who fired the killing shot (per-player score).
+		if killer_id >= 0 and net_states.has(killer_id):
+			net_states[killer_id]["kills"] = int(net_states[killer_id].get("kills", 0)) + 1
+	else:
+		kills += 1
 	var gem_count: int = 1
 	if e.type == "shooter":
 		gem_count = 2
@@ -3840,6 +5025,9 @@ func _kill_enemy(e: Entity) -> void:
 		gem_count = 12
 	for i in gem_count:
 		_spawn_gem(e.pos + Vector3(randf_range(-0.4, 0.4), randf_range(-0.4, 0.4), 0), e.value)
+	if net_mode == NetMode.SERVER:
+		despawn_enemy.rpc(e.net_id)
+		return
 	_camera_shake(0.6 if e.type == "boss" else 0.18, 0.25 if e.type == "boss" else 0.1)
 
 func _player_take_damage(dmg: int) -> void:
@@ -3982,7 +5170,7 @@ func _next_wave() -> void:
 	wave += 1
 	wave_timer = WAVE_DURATION
 	spawn_interval = max(0.35, 1.5 - wave * 0.08)
-	if wave % BOSS_EVERY == 0:
+	if wave % BOSS_EVERY == 0 and _party_level() >= BOSS_MIN_LEVEL:
 		_spawn_boss_wave()
 
 func _xp_for_next() -> int:
@@ -3997,6 +5185,10 @@ func _check_level_up() -> void:
 
 func _offer_levelup() -> void:
 	state = STATE_LEVELUP
+	# Tell the server we're picking an upgrade so it keeps us invulnerable while the
+	# world keeps simulating around us (co-op: no shared pause).
+	if net_mode == NetMode.CLIENT:
+		notify_busy.rpc_id(1, true)
 	var pool := _upgrade_pool()
 	pool.shuffle()
 	var picks: Array = []
@@ -4028,9 +5220,9 @@ func _upgrade_pool() -> Array:
 	]
 
 func _up_proj():   u_projectiles += 1;       _visual_add_gun()
-func _up_rate():   u_fire_rate_mult *= 1.25; _visual_add_engine()
+func _up_rate():   u_fire_rate_mult *= 1.25; _visual_add_rate_coil()   # weapon overclock, not an engine
 func _up_dmg():    u_damage = int(round(u_damage * 1.30)); _visual_grow_damage_core()
-func _up_speed():  u_speed_mult *= 1.15;     _visual_add_speed_fin()
+func _up_speed():  u_speed_mult *= 1.15;     _visual_add_engine()      # speed = thruster pods
 func _up_range():
 	u_range_mult *= 1.25
 	_visual_add_sensor()
@@ -4050,8 +5242,10 @@ func _up_pierce(): u_pierce += 1;            _visual_set_pierce_lance()
 func _up_boost_tank():
 	u_boost_max *= 1.40
 	boost_charge = u_boost_max  # refund full on capacity upgrade
+	_visual_add_boost_tank()
 func _up_boost_strength():
 	u_boost_strength += 0.25
+	_visual_add_boost_nozzle()
 
 # ============================================================
 # Visual upgrade attachments
@@ -4068,26 +5262,26 @@ func _mat_metal(albedo: Color, emit_e: float = 0.3) -> StandardMaterial3D:
 	return m
 
 func _visual_add_gun() -> void:
-	# Side-mounted gun barrel — custom (Kenney models had orientation issues)
+	# Small wing-mounted cannon — compact, not a big long cylinder.
 	var n: int = visual_guns.size()
 	var side: int = -1 if (n % 2 == 0) else 1
 	var stack: int = (n / 2) + 1
 	var gun_root := Node3D.new()
-	# Barrel (cylinder)
+	# Short stubby barrel
 	var gun := MeshInstance3D.new()
 	var cm := CylinderMesh.new()
-	cm.top_radius = 0.07
-	cm.bottom_radius = 0.09
-	cm.height = 0.6
-	cm.material = _mat_metal(Color(0.45, 0.5, 0.6))
+	cm.top_radius = 0.032
+	cm.bottom_radius = 0.05
+	cm.height = 0.26
+	cm.material = _mat_metal(Color(0.42, 0.47, 0.56))
 	gun.mesh = cm
-	gun.position = Vector3(0.45, 0.0, 0)
+	gun.position = Vector3(0.26, 0.0, 0)
 	gun.rotation_degrees = Vector3(0, 0, 90)
 	gun_root.add_child(gun)
-	# Muzzle glow
+	# Tiny muzzle glow
 	var muzzle := MeshInstance3D.new()
 	var mm := SphereMesh.new()
-	mm.radius = 0.08; mm.height = 0.16
+	mm.radius = 0.045; mm.height = 0.09
 	var mmat := StandardMaterial3D.new()
 	mmat.albedo_color = Color(0.5, 1.0, 0.95)
 	mmat.emission_enabled = true
@@ -4096,50 +5290,52 @@ func _visual_add_gun() -> void:
 	mmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	mm.material = mmat
 	muzzle.mesh = mm
-	muzzle.position = Vector3(0.78, 0.0, 0)
+	muzzle.position = Vector3(0.42, 0.0, 0)
 	gun_root.add_child(muzzle)
-	# Mount base
+	# Small mount
 	var mount := MeshInstance3D.new()
 	var bm := BoxMesh.new()
-	bm.size = Vector3(0.18, 0.1, 0.2); bm.material = _mat_metal(Color(0.3, 0.34, 0.4))
+	bm.size = Vector3(0.11, 0.07, 0.12); bm.material = _mat_metal(Color(0.3, 0.34, 0.4))
 	mount.mesh = bm
-	mount.position = Vector3(0.18, -0.05, 0)
+	mount.position = Vector3(0.1, -0.03, 0)
 	gun_root.add_child(mount)
-	# Position on wing
-	gun_root.position = Vector3(0.0, 0.05, side * (0.3 + stack * 0.18))
+	gun_root.position = Vector3(0.04, 0.05, side * (0.26 + stack * 0.15))
 	ship_render.add_child(gun_root)
 	visual_guns.append(gun_root)
 
 func _visual_add_engine() -> void:
-	# Extra side thruster — adds power and visual
+	# Speed: a small, cleanly-shaped tapered thruster nozzle at the rear.
 	var n: int = visual_engines.size()
 	var side: int = -1 if (n % 2 == 0) else 1
 	var stack: int = (n / 2) + 1
-	var pod := MeshInstance3D.new()
+	var zpos: float = side * (0.32 + stack * 0.16)
+	# Tapered nozzle (narrow at the front, flares at the rear exit)
+	var noz := MeshInstance3D.new()
 	var cm := CylinderMesh.new()
-	cm.top_radius = 0.1
-	cm.bottom_radius = 0.12
-	cm.height = 0.4
+	cm.top_radius = 0.085   # rear flare
+	cm.bottom_radius = 0.05 # front (mates to hull)
+	cm.height = 0.22
 	cm.material = _mat_metal(Color(0.4, 0.45, 0.55))
-	pod.mesh = cm
-	pod.position = Vector3(-0.5, -0.02, side * (0.4 + stack * 0.18))
-	pod.rotation_degrees = Vector3(0, 0, 90)
-	ship_render.add_child(pod)
-	# Thruster glow
+	noz.mesh = cm
+	noz.position = Vector3(-0.52, -0.02, zpos)
+	noz.rotation_degrees = Vector3(0, 0, 90)
+	ship_render.add_child(noz)
+	# Small bright exhaust glow at the nozzle exit
 	var glow := MeshInstance3D.new()
-	var sm := SphereMesh.new()
-	sm.radius = 0.13; sm.height = 0.26
+	var gm := CylinderMesh.new()
+	gm.top_radius = 0.07; gm.bottom_radius = 0.02; gm.height = 0.1
 	var gmat := StandardMaterial3D.new()
 	gmat.albedo_color = Color(0.5, 0.9, 1.0)
 	gmat.emission_enabled = true
 	gmat.emission = Color(0.5, 0.9, 1.0)
-	gmat.emission_energy_multiplier = 3.5
+	gmat.emission_energy_multiplier = 4.0
 	gmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	sm.material = gmat
-	glow.mesh = sm
-	glow.position = Vector3(-0.78, -0.02, side * (0.4 + stack * 0.18))
+	gm.material = gmat
+	glow.mesh = gm
+	glow.position = Vector3(-0.66, -0.02, zpos)
+	glow.rotation_degrees = Vector3(0, 0, 90)
 	ship_render.add_child(glow)
-	visual_engines.append(pod)
+	visual_engines.append(noz)
 
 func _visual_grow_damage_core() -> void:
 	# Damage upgrade: glowing energy core under cockpit grows brighter/larger
@@ -4202,13 +5398,15 @@ func _visual_add_sensor() -> void:
 	visual_sensors.append(stalk)
 
 func _visual_set_pickup_ring() -> void:
-	# Magnetic pickup ring around ship — single torus, not noisy dots
+	# Magnetic pickup ring around the ship — radius scales with the pickup level, so
+	# each upgrade visibly widens the collection ring.
 	if visual_pickup_ring != null:
 		visual_pickup_ring.queue_free()
 	visual_pickup_ring = MeshInstance3D.new()
+	var inner: float = 0.7 * u_pickup_mult
 	var tm := TorusMesh.new()
-	tm.inner_radius = 0.92
-	tm.outer_radius = 0.98
+	tm.inner_radius = inner
+	tm.outer_radius = inner + 0.06
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = Color(0.95, 0.7, 1.0)
 	mat.emission_enabled = true
@@ -4216,32 +5414,51 @@ func _visual_set_pickup_ring() -> void:
 	mat.emission_energy_multiplier = 1.8
 	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	mat.albedo_color.a = 0.7
+	mat.albedo_color.a = 0.55
 	tm.material = mat
 	visual_pickup_ring.mesh = tm
 	# Torus default lies in XZ plane (open along Y) — perfect for our ring around ship
 	ship_render.add_child(visual_pickup_ring)
 
 func _visual_add_armor() -> void:
-	# Custom armor plate strapped to hull
+	# Layered steel armor plating hugging the hull (base plate + raised plate +
+	# glowing edge trim) — reads as real armor, not a flat copper box.
 	var n: int = visual_armor.size()
 	var side: int = -1 if (n % 2 == 0) else 1
 	var stack: int = (n / 2)
-	var plate := MeshInstance3D.new()
-	var bm := BoxMesh.new()
-	bm.size = Vector3(0.5, 0.12, 0.18)
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.55, 0.4, 0.3)
-	mat.emission_enabled = true
-	mat.emission = Color(0.3, 0.2, 0.15)
-	mat.emission_energy_multiplier = 0.25
-	mat.metallic = 0.5
-	mat.roughness = 0.6
-	bm.material = mat
-	plate.mesh = bm
-	plate.position = Vector3(-0.15 + stack * 0.3, 0.05, side * 0.5)
-	ship_render.add_child(plate)
-	visual_armor.append(plate)
+	var root := Node3D.new()
+	var steel := _mat_metal(Color(0.5, 0.55, 0.62), 0.12)
+	steel.roughness = 0.45
+	# Base plate (flat, hugs the hull)
+	var base := MeshInstance3D.new()
+	var bb := BoxMesh.new()
+	bb.size = Vector3(0.4, 0.055, 0.16); bb.material = steel
+	base.mesh = bb
+	root.add_child(base)
+	# Raised upper plate (layered look)
+	var top := MeshInstance3D.new()
+	var tb := BoxMesh.new()
+	tb.size = Vector3(0.27, 0.05, 0.12); tb.material = steel
+	top.mesh = tb
+	top.position = Vector3(0.0, 0.05, 0)
+	root.add_child(top)
+	# Thin glowing trim strip along the outer edge
+	var trim := MeshInstance3D.new()
+	var trb := BoxMesh.new()
+	trb.size = Vector3(0.4, 0.02, 0.025)
+	var tmat := StandardMaterial3D.new()
+	tmat.albedo_color = Color(0.5, 0.85, 1.0)
+	tmat.emission_enabled = true
+	tmat.emission = Color(0.45, 0.8, 1.0)
+	tmat.emission_energy_multiplier = 1.6
+	tmat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	trb.material = tmat
+	trim.mesh = trb
+	trim.position = Vector3(0.0, 0.02, side * 0.085)
+	root.add_child(trim)
+	root.position = Vector3(-0.1 + stack * 0.28, 0.04, side * 0.46)
+	ship_render.add_child(root)
+	visual_armor.append(root)
 
 func _visual_set_pierce_lance() -> void:
 	# Custom tapered cylinder forming a spike — pierce upgrade
@@ -4251,8 +5468,8 @@ func _visual_set_pierce_lance() -> void:
 	var spike := MeshInstance3D.new()
 	var cm := CylinderMesh.new()
 	cm.top_radius = 0.0
-	cm.bottom_radius = 0.08
-	cm.height = 0.45 + u_pierce * 0.18
+	cm.bottom_radius = 0.05
+	cm.height = 0.22 + u_pierce * 0.06
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = Color(1.0, 0.6, 0.4)
 	mat.emission_enabled = true
@@ -4263,10 +5480,115 @@ func _visual_set_pierce_lance() -> void:
 	cm.material = mat
 	spike.mesh = cm
 	# Cylinder default vertical (+Y up). Rotate Z=-90° to lay it forward (+X tip).
-	spike.position = Vector3(1.15 + u_pierce * 0.06 + (cm.height * 0.5), 0, 0)
+	# Small spike sitting at the nose (not a big lance floating ahead).
+	spike.position = Vector3(0.92 + (cm.height * 0.5), 0, 0)
 	spike.rotation_degrees = Vector3(0, 0, -90)
 	visual_pierce.add_child(spike)
 	ship_render.add_child(visual_pierce)
+
+func _visual_add_rate_coil() -> void:
+	# Fire-rate: a small glowing weapon "overclock" cell beside the guns — a bright
+	# energy core with thin dark caps + a glow ring. Reads as hotter, faster-firing
+	# weapons (not a gray block, not an engine).
+	var n: int = visual_rate_coils.size()
+	var side: int = -1 if (n % 2 == 0) else 1
+	var stack: int = n / 2
+	var root := Node3D.new()
+	# Bright glowing energy core (the main visual)
+	var emat := StandardMaterial3D.new()
+	emat.albedo_color = Color(1.0, 0.55, 0.18)
+	emat.emission_enabled = true
+	emat.emission = Color(1.0, 0.45, 0.12)
+	emat.emission_energy_multiplier = 3.8
+	emat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	var core := MeshInstance3D.new()
+	var cm := CylinderMesh.new()
+	cm.top_radius = 0.045; cm.bottom_radius = 0.045; cm.height = 0.2
+	cm.material = emat
+	core.mesh = cm
+	core.rotation_degrees = Vector3(0, 0, 90)
+	root.add_child(core)
+	# Thin dark metal end caps
+	var capmat := _mat_metal(Color(0.28, 0.31, 0.38))
+	for ex in [-0.1, 0.1]:
+		var cap := MeshInstance3D.new()
+		var ccm := CylinderMesh.new()
+		ccm.top_radius = 0.055; ccm.bottom_radius = 0.055; ccm.height = 0.04
+		ccm.material = capmat
+		cap.mesh = ccm
+		cap.rotation_degrees = Vector3(0, 0, 90)
+		cap.position = Vector3(ex, 0, 0)
+		root.add_child(cap)
+	# Glow ring around the middle
+	var ring := MeshInstance3D.new()
+	var tm := TorusMesh.new()
+	tm.inner_radius = 0.05; tm.outer_radius = 0.072
+	tm.material = emat
+	ring.mesh = tm
+	ring.rotation_degrees = Vector3(0, 0, 90)
+	root.add_child(ring)
+	root.position = Vector3(0.1, 0.12, side * (0.26 + stack * 0.15))
+	ship_render.add_child(root)
+	visual_rate_coils.append(root)
+
+func _visual_add_boost_tank() -> void:
+	# Boost capacity: extra fuel canisters strapped to the rear spine. More tank = more boost.
+	var n: int = visual_boost_tanks.size()
+	var side: int = -1 if (n % 2 == 0) else 1
+	var stack: int = n / 2
+	var root := Node3D.new()
+	var tank := MeshInstance3D.new()
+	var cm := CapsuleMesh.new()
+	cm.radius = 0.07; cm.height = 0.34
+	cm.material = _mat_metal(Color(0.42, 0.46, 0.52))
+	tank.mesh = cm
+	tank.rotation_degrees = Vector3(0, 0, 90)   # lie along X
+	root.add_child(tank)
+	# Glowing fuel-level stripe
+	var stripe := MeshInstance3D.new()
+	var sc := CylinderMesh.new()
+	sc.top_radius = 0.074; sc.bottom_radius = 0.074; sc.height = 0.08
+	var smat := StandardMaterial3D.new()
+	smat.albedo_color = Color(0.3, 0.9, 1.0)
+	smat.emission_enabled = true
+	smat.emission = Color(0.3, 0.85, 1.0)
+	smat.emission_energy_multiplier = 2.4
+	smat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	sc.material = smat
+	stripe.mesh = sc
+	stripe.rotation_degrees = Vector3(0, 0, 90)
+	root.add_child(stripe)
+	root.position = Vector3(-0.36, 0.16 + stack * 0.14, side * 0.13)
+	ship_render.add_child(root)
+	visual_boost_tanks.append(root)
+
+func _visual_add_boost_nozzle() -> void:
+	# Boost strength: flared afterburner nozzles around the twin engine exits.
+	# Rebuilt each upgrade so they grow with boost strength.
+	if visual_boost_nozzle != null:
+		visual_boost_nozzle.queue_free()
+	visual_boost_nozzle = Node3D.new()
+	var steps: float = max(1.0, round((u_boost_strength - 1.8) / 0.25))   # number of strength upgrades
+	var flare: float = 0.15 + steps * 0.03
+	var length: float = 0.18 + steps * 0.025
+	var nmat := StandardMaterial3D.new()
+	nmat.albedo_color = Color(0.4, 0.6, 0.95)
+	nmat.emission_enabled = true
+	nmat.emission = Color(0.35, 0.6, 1.0)
+	nmat.emission_energy_multiplier = 1.8
+	nmat.metallic = 0.8; nmat.roughness = 0.25
+	for zsign in [-1, 1]:
+		var noz := MeshInstance3D.new()
+		var cm := CylinderMesh.new()
+		cm.top_radius = flare      # wide flare at the rear (-X after Z+90 rotation)
+		cm.bottom_radius = 0.1     # narrow end meets the engine
+		cm.height = length
+		cm.material = nmat
+		noz.mesh = cm
+		noz.rotation_degrees = Vector3(0, 0, 90)
+		noz.position = Vector3(-0.93 - length * 0.5, -0.02, zsign * 0.14)
+		visual_boost_nozzle.add_child(noz)
+	ship_render.add_child(visual_boost_nozzle)
 
 func _on_levelup_pick(idx: int) -> void:
 	if idx >= levelup_buttons.size():
@@ -4278,18 +5600,158 @@ func _on_levelup_pick(idx: int) -> void:
 	up["apply"].call()
 	levelup_panel.visible = false
 	state = STATE_PLAYING
+	# Resume server-side damage, but keep a short grace window so we're not instantly
+	# hit by whatever drifted into us while the menu was open.
+	if net_mode == NetMode.CLIENT:
+		notify_busy.rpc_id(1, false)
+		p_invuln_timer = maxf(p_invuln_timer, 1.0)
 
 # ============================================================
 # State / restart / shake
 # ============================================================
 
 func _check_state() -> void:
-	if p_hp <= 0:
-		state = STATE_GAMEOVER
-		go_panel.visible = true
-		go_title.text = "GAME OVER"
-		go_title.add_theme_color_override("font_color", Color(1.0, 0.45, 0.4))
-		go_detail.text = "Welle %d  ·  %d Kills  ·  %d Sekunden überlebt\n\n[ Leertaste / Klick = Neuer Run ]" % [wave, kills, int(run_time)]
+	if p_hp > 0 or state == STATE_GAMEOVER:
+		return
+	# Co-op: tell the server we're down so it stops damaging us and spawning on the
+	# corpse while the death screen is up. Single-player just freezes behind it.
+	if net_mode == NetMode.CLIENT:
+		notify_busy.rpc_id(1, true)
+	_show_gameover()
+
+func _show_gameover() -> void:
+	state = STATE_GAMEOVER
+	menu_open = false
+	if esc_panel != null:
+		esc_panel.visible = false
+	go_panel.visible = true
+	go_title.text = "GAME OVER"
+	go_title.add_theme_color_override("font_color", Color(1.0, 0.45, 0.4))
+	go_detail.text = _run_stats_text()
+	# Prime the highscore entry: prefill the name, re-arm the save button, and pull
+	# the freshest board from the server so it shows up to date.
+	score_submitted = false
+	if go_name_edit != null:
+		go_name_edit.text = player_name
+	if go_save_btn != null:
+		go_save_btn.disabled = false
+		go_save_btn.text = "Score speichern"
+	if net_mode == NetMode.CLIENT and net_connected:
+		request_highscores.rpc_id(1)
+	_update_personal_best()
+	_refresh_go_board()
+
+# Submit the just-finished run to the leaderboard (server-global in co-op, local
+# file in single-player), using the name currently in the field.
+func _on_save_score() -> void:
+	if score_submitted:
+		return
+	if go_name_edit != null:
+		player_name = _sanitize_name(go_name_edit.text)
+	_save_settings()
+	score_submitted = true
+	if go_save_btn != null:
+		go_save_btn.disabled = true
+		go_save_btn.text = "Gespeichert ✓"
+	var lvl := p_level
+	var wv := wave
+	var kl := kills
+	var tm := int(run_time)
+	if net_mode == NetMode.CLIENT:
+		if net_connected:
+			set_player_name.rpc_id(1, player_name)
+			submit_score.rpc_id(1, player_name, lvl, wv, kl, tm)
+	else:
+		# Single-player: keep a local board on disk.
+		highscores.append({"name": player_name, "level": lvl, "wave": wv, "kills": kl, "time": tm})
+		_sort_highscores()
+		if highscores.size() > HS_MAX:
+			highscores.resize(HS_MAX)
+		_save_highscores_server()
+		_refresh_go_board()
+
+func _refresh_go_board() -> void:
+	if go_board_label != null:
+		go_board_label.text = _highscore_text(12)
+
+func _run_stats_text() -> String:
+	var secs := int(run_time)
+	var tstr := "%d:%02d" % [secs / 60, secs % 60]
+	var line1 := "Welle %d     ·     %d Kills     ·     %s überlebt     ·     Level %d" % [wave, kills, tstr, p_level]
+	var line2 := "Schaden %d   ·   Feuerrate %d%%   ·   Schüsse/Salve %d   ·   Durchschlag %d" % [u_damage, int(round(u_fire_rate_mult * 100.0)), u_projectiles, u_pierce]
+	var line3 := "Tempo %d%%   ·   Reichweite %d%%   ·   Max HP %d   ·   Pickup %d%%" % [int(round(u_speed_mult * 100.0)), int(round(u_range_mult * 100.0)), p_max_hp, int(round(u_pickup_mult * 100.0))]
+	var line4 := "Boost-Tank %d%%   ·   Boost-Stärke %d%%" % [int(round(u_boost_max * 100.0)), int(round(u_boost_strength / 1.8 * 100.0))]
+	return line1 + "\n\n" + line2 + "\n" + line3 + "\n" + line4
+
+# Buttons on the death screen dispatch by mode: co-op keeps the shared world alive,
+# single-player does a full local reset.
+func _on_restart_pressed() -> void:
+	if net_mode == NetMode.CLIENT:
+		_coop_restart()
+	else:
+		_restart_run()
+
+func _on_give_up_pressed() -> void:
+	if net_mode == NetMode.CLIENT and multiplayer.multiplayer_peer != null:
+		multiplayer.multiplayer_peer.close()
+	get_tree().quit()
+
+# Co-op restart: leave the server-owned world untouched (enemies/bullets/gems keep
+# streaming in) — just reset our own progression and rejoin with a grace window.
+func _coop_restart() -> void:
+	_reset_player_progression()
+	run_time = 0.0
+	kills = 0
+	wave = 1
+	reset_my_run.rpc_id(1)   # tell the server to reset our per-player wave + kills too
+	notify_busy.rpc_id(1, false)
+	p_invuln_timer = maxf(p_invuln_timer, 2.0)
+	state = STATE_PLAYING
+	menu_open = false
+	go_panel.visible = false
+	levelup_panel.visible = false
+	if esc_panel != null:
+		esc_panel.visible = false
+	if settings_panel != null:
+		settings_panel.visible = false
+
+# Resets the ship + all upgrade stats back to a fresh run. Shared by the
+# single-player full restart and the co-op rejoin.
+func _reset_player_progression() -> void:
+	if p_node != null:
+		p_node.queue_free()
+	visual_guns.clear()
+	visual_engines.clear()
+	visual_armor.clear()
+	visual_sensors.clear()
+	visual_speed_fins.clear()
+	visual_rate_coils.clear()
+	visual_boost_tanks.clear()
+	visual_boost_nozzle = null
+	visual_pierce = null
+	visual_pickup_ring = null
+	visual_damage_core = null
+	visual_damage_lvl = 0
+	_build_player()
+	p_vel = Vector3.ZERO
+	p_hp = P_HP
+	p_max_hp = P_HP
+	p_level = 1
+	p_xp = 0
+	fire_timer = 0.0
+	u_speed_mult = 1.0
+	u_fire_rate_mult = 1.0
+	u_damage = 12
+	u_projectiles = 1
+	u_range_mult = 1.0
+	_apply_range_zoom()
+	u_pickup_mult = 1.0
+	u_pierce = 0
+	u_boost_max = 1.0
+	u_boost_strength = 1.8
+	boost_charge = 1.0
+	boosting = false
+	boost_depleted = false
 
 func _restart_run() -> void:
 	for e in enemies:
@@ -4308,49 +5770,23 @@ func _restart_run() -> void:
 	p_bullets.clear()
 	e_bullets.clear()
 	gems.clear()
-	# Rebuild player ship (clears all visual upgrades)
-	if p_node != null:
-		p_node.queue_free()
-	visual_guns.clear()
-	visual_engines.clear()
-	visual_armor.clear()
-	visual_sensors.clear()
-	visual_speed_fins.clear()
-	visual_pierce = null
-	visual_pickup_ring = null
-	visual_damage_core = null
-	visual_damage_lvl = 0
-	_build_player()
+	_reset_player_progression()
 	p_pos = Vector3.ZERO
-	p_vel = Vector3.ZERO
-	p_hp = P_HP
-	p_max_hp = P_HP
-	p_level = 1
-	p_xp = 0
 	wave = 1
 	wave_timer = WAVE_DURATION
 	spawn_timer = 1.5
 	spawn_interval = 1.5
-	fire_timer = 0.0
 	p_invuln_timer = 0.0
-	u_speed_mult = 1.0
-	u_fire_rate_mult = 1.0
-	u_damage = 12
-	u_projectiles = 1
-	u_range_mult = 1.0
-	_apply_range_zoom()
-	u_pickup_mult = 1.0
-	u_pierce = 0
-	u_boost_max = 1.0
-	u_boost_strength = 1.8
-	boost_charge = 1.0
-	boosting = false
-	boost_depleted = false
 	kills = 0
 	run_time = 0.0
 	state = STATE_PLAYING
+	menu_open = false
 	go_panel.visible = false
 	levelup_panel.visible = false
+	if esc_panel != null:
+		esc_panel.visible = false
+	if settings_panel != null:
+		settings_panel.visible = false
 
 func _purge_dead() -> void:
 	var keep_e: Array = []
@@ -4580,6 +6016,13 @@ func _animate_background(delta: float) -> void:
 func _build_hud() -> void:
 	hud = CanvasLayer.new()
 	add_child(hud)
+	# All gameplay HUD lives in this container so the home screen can hide it in one shot.
+	# Overlay panels (level-up / game-over / ESC / settings / home) are added to `hud`
+	# directly, so they keep drawing on top of the gameplay HUD.
+	hud_game = Control.new()
+	hud_game.size = Vector2(1280, 720)
+	hud_game.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hud.add_child(hud_game)
 
 	lbl_hp = _hud_label("", Vector2(18, 14), 14, COL_TEXT)
 	_hud_rect(Vector2(18, 36), Vector2(260, 12), Color(0.12, 0.06, 0.08))
@@ -4603,11 +6046,6 @@ func _build_hud() -> void:
 
 	lbl_stats = _hud_label("", Vector2(18, 690), 11, COL_DIM)
 
-	lbl_pause = _hud_label("‖  PAUSIERT  ·  [Leer] weiter", Vector2(0, 340), 22, Color(1.0, 0.9, 0.4))
-	lbl_pause.size = Vector2(1280, 40)
-	lbl_pause.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	lbl_pause.visible = false
-
 	var lbl_ver := _hud_label("v" + GAME_VERSION, Vector2(1130, 700), 10, Color(0.45, 0.55, 0.7))
 	lbl_ver.size = Vector2(130, 16)
 	lbl_ver.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
@@ -4618,7 +6056,7 @@ func _build_hud() -> void:
 	radar.size = Vector2(radar.radius_pixels * 2.0, radar.radius_pixels * 2.0)
 	radar.position = Vector2(1280 - radar.size.x - 20, 720 - radar.size.y - 20)
 	radar.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud.add_child(radar)
+	hud_game.add_child(radar)
 
 func _hud_label(text: String, pos: Vector2, size: int, col: Color) -> Label:
 	var l := Label.new()
@@ -4626,7 +6064,7 @@ func _hud_label(text: String, pos: Vector2, size: int, col: Color) -> Label:
 	l.position = pos
 	l.add_theme_color_override("font_color", col)
 	l.add_theme_font_size_override("font_size", size)
-	hud.add_child(l)
+	hud_game.add_child(l)
 	return l
 
 func _hud_rect(pos: Vector2, size: Vector2, col: Color) -> ColorRect:
@@ -4635,7 +6073,7 @@ func _hud_rect(pos: Vector2, size: Vector2, col: Color) -> ColorRect:
 	r.size = size
 	r.color = col
 	r.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud.add_child(r)
+	hud_game.add_child(r)
 	return r
 
 func _update_ui_text() -> void:
@@ -4648,7 +6086,12 @@ func _update_ui_text() -> void:
 	var boost_frac: float = clamp(boost_charge / max(u_boost_max, 0.01), 0.0, 1.0)
 	bar_boost_fill.size = Vector2(260.0 * boost_frac, 6)
 	bar_boost_fill.color = Color(1.0, 0.9, 0.45) if boosting else Color(1.0, 0.65, 0.25)
-	lbl_wave.text = "WELLE %d   %ds" % [wave, max(0, int(ceil(wave_timer)))]
+	# Co-op: the wave timer ticks per-player on the server and isn't streamed, so
+	# just show the wave number; single-player keeps the live countdown.
+	if net_mode == NetMode.CLIENT:
+		lbl_wave.text = "WELLE %d" % wave
+	else:
+		lbl_wave.text = "WELLE %d   %ds" % [wave, max(0, int(ceil(wave_timer)))]
 	lbl_time.text = "%02d:%02d" % [int(run_time) / 60, int(run_time) % 60]
 	lbl_stats.text = "Schaden %d  ·  Schüsse %d  ·  Feuerrate %.0f%%  ·  Reichweite %.0f%%  ·  Tempo %.0f%%  ·  Durchschlag %d  ·  Kills %d" % [
 		u_damage, u_projectiles, u_fire_rate_mult * 100.0,
@@ -4710,28 +6153,843 @@ func _build_go_panel() -> void:
 	hud.add_child(go_panel)
 	var bg := ColorRect.new()
 	bg.size = Vector2(1280, 720)
-	bg.color = Color(0.0, 0.0, 0.0, 0.82)
+	bg.color = Color(0.0, 0.0, 0.0, 0.86)
 	go_panel.add_child(bg)
 	go_title = Label.new()
-	go_title.position = Vector2(0, 240)
-	go_title.size = Vector2(1280, 80)
+	go_title.position = Vector2(0, 36)
+	go_title.size = Vector2(1280, 72)
 	go_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	go_title.add_theme_font_size_override("font_size", 64)
+	go_title.add_theme_font_size_override("font_size", 56)
 	go_panel.add_child(go_title)
 	go_detail = Label.new()
-	go_detail.position = Vector2(0, 360)
-	go_detail.size = Vector2(1280, 200)
+	go_detail.position = Vector2(0, 120)
+	go_detail.size = Vector2(1280, 120)
 	go_detail.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	go_detail.add_theme_color_override("font_color", COL_DIM)
-	go_detail.add_theme_font_size_override("font_size", 18)
+	go_detail.add_theme_font_size_override("font_size", 16)
 	go_panel.add_child(go_detail)
+
+	# Highscore entry row: name field + save button.
+	var name_lbl := Label.new()
+	name_lbl.text = "Dein Name:"
+	name_lbl.position = Vector2(330, 256)
+	name_lbl.size = Vector2(120, 40)
+	name_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	name_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	name_lbl.add_theme_color_override("font_color", COL_TEXT)
+	name_lbl.add_theme_font_size_override("font_size", 16)
+	go_panel.add_child(name_lbl)
+	go_name_edit = LineEdit.new()
+	go_name_edit.position = Vector2(462, 252)
+	go_name_edit.size = Vector2(260, 44)
+	go_name_edit.max_length = 18
+	go_name_edit.placeholder_text = "Pilot"
+	go_name_edit.add_theme_font_size_override("font_size", 18)
+	go_panel.add_child(go_name_edit)
+	go_save_btn = Button.new()
+	go_save_btn.text = "Score speichern"
+	go_save_btn.position = Vector2(738, 252)
+	go_save_btn.size = Vector2(180, 44)
+	go_save_btn.add_theme_font_size_override("font_size", 16)
+	go_save_btn.pressed.connect(_on_save_score)
+	go_panel.add_child(go_save_btn)
+
+	# Leaderboard.
+	var board_hdr := Label.new()
+	board_hdr.text = "★  BESTENLISTE  ★"
+	board_hdr.position = Vector2(0, 312)
+	board_hdr.size = Vector2(1280, 28)
+	board_hdr.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	board_hdr.add_theme_color_override("font_color", Color(1.0, 0.85, 0.45))
+	board_hdr.add_theme_font_size_override("font_size", 20)
+	go_panel.add_child(board_hdr)
+	go_board_label = Label.new()
+	go_board_label.position = Vector2(0, 348)
+	go_board_label.size = Vector2(1280, 250)
+	go_board_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	go_board_label.add_theme_color_override("font_color", COL_TEXT)
+	go_board_label.add_theme_font_size_override("font_size", 15)
+	go_panel.add_child(go_board_label)
+
 	var restart_btn := Button.new()
-	restart_btn.text = "Neuer Run"
-	restart_btn.position = Vector2(540, 540)
-	restart_btn.size = Vector2(200, 50)
-	restart_btn.add_theme_font_size_override("font_size", 18)
-	restart_btn.pressed.connect(_restart_run)
+	restart_btn.text = "Neu Starten"
+	restart_btn.position = Vector2(420, 636)
+	restart_btn.size = Vector2(200, 52)
+	restart_btn.add_theme_font_size_override("font_size", 20)
+	restart_btn.pressed.connect(_on_restart_pressed)
 	go_panel.add_child(restart_btn)
+	var giveup_btn := Button.new()
+	giveup_btn.text = "Aufgeben"
+	giveup_btn.position = Vector2(660, 636)
+	giveup_btn.size = Vector2(200, 52)
+	giveup_btn.add_theme_font_size_override("font_size", 20)
+	giveup_btn.pressed.connect(_on_give_up_pressed)
+	go_panel.add_child(giveup_btn)
+
+# ============================================================
+# ESC screen — self-pause + server roster + leaderboard + settings
+# ============================================================
+
+func _build_esc_panel() -> void:
+	esc_panel = Control.new()
+	esc_panel.size = Vector2(1280, 720)
+	esc_panel.visible = false
+	hud.add_child(esc_panel)
+
+	var bg := ColorRect.new()
+	bg.size = Vector2(1280, 720)
+	bg.color = Color(0.0, 0.01, 0.04, 0.84)
+	esc_panel.add_child(bg)
+
+	var title := Label.new()
+	title.text = "PAUSE"
+	title.position = Vector2(0, 24)
+	title.size = Vector2(1280, 56)
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.add_theme_color_override("font_color", Color(0.6, 0.95, 1.0))
+	title.add_theme_font_size_override("font_size", 44)
+	esc_panel.add_child(title)
+
+	var sub := Label.new()
+	sub.text = "Du bist geschützt — kein Schaden, keine Gegner spawnen um dich"
+	sub.position = Vector2(0, 84)
+	sub.size = Vector2(1280, 26)
+	sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	sub.add_theme_color_override("font_color", COL_DIM)
+	sub.add_theme_font_size_override("font_size", 15)
+	esc_panel.add_child(sub)
+
+	# Left column — who's online.
+	var ros_hdr := Label.new()
+	ros_hdr.text = "SPIELER ONLINE"
+	ros_hdr.position = Vector2(90, 140)
+	ros_hdr.size = Vector2(420, 26)
+	ros_hdr.add_theme_color_override("font_color", Color(0.55, 0.95, 1.0))
+	ros_hdr.add_theme_font_size_override("font_size", 20)
+	esc_panel.add_child(ros_hdr)
+	esc_roster_label = Label.new()
+	esc_roster_label.position = Vector2(90, 178)
+	esc_roster_label.size = Vector2(420, 360)
+	esc_roster_label.add_theme_color_override("font_color", COL_TEXT)
+	esc_roster_label.add_theme_font_size_override("font_size", 16)
+	esc_panel.add_child(esc_roster_label)
+
+	# Right column — leaderboard.
+	var brd_hdr := Label.new()
+	brd_hdr.text = "★  BESTENLISTE  ★"
+	brd_hdr.position = Vector2(560, 140)
+	brd_hdr.size = Vector2(640, 26)
+	brd_hdr.add_theme_color_override("font_color", Color(1.0, 0.85, 0.45))
+	brd_hdr.add_theme_font_size_override("font_size", 20)
+	esc_panel.add_child(brd_hdr)
+	esc_board_label = Label.new()
+	esc_board_label.position = Vector2(560, 178)
+	esc_board_label.size = Vector2(640, 360)
+	esc_board_label.add_theme_color_override("font_color", COL_TEXT)
+	esc_board_label.add_theme_font_size_override("font_size", 15)
+	esc_panel.add_child(esc_board_label)
+
+	# Button row: Weiter · Neu Starten · Aufgeben · Einstellungen
+	var labels := ["Weiter", "Neu Starten", "Aufgeben", "Einstellungen"]
+	var calls := [Callable(self, "_toggle_esc_menu"), Callable(self, "_on_restart_pressed"),
+		Callable(self, "_on_give_up_pressed"), Callable(self, "_open_settings")]
+	var bw: float = 200.0
+	var gap: float = 20.0
+	var start_x: float = (1280.0 - (bw * 4 + gap * 3)) * 0.5
+	for i in 4:
+		var b := Button.new()
+		b.text = labels[i]
+		b.position = Vector2(start_x + i * (bw + gap), 600)
+		b.size = Vector2(bw, 52)
+		b.add_theme_font_size_override("font_size", 18)
+		b.pressed.connect(calls[i])
+		esc_panel.add_child(b)
+
+	_build_settings_panel()
+
+func _build_settings_panel() -> void:
+	settings_panel = Control.new()
+	settings_panel.size = Vector2(1280, 720)
+	settings_panel.visible = false
+	hud.add_child(settings_panel)   # top-level overlay so it opens from ESC *and* the home screen
+
+	var dim := ColorRect.new()
+	dim.size = Vector2(1280, 720)
+	dim.color = Color(0.0, 0.0, 0.0, 0.6)
+	settings_panel.add_child(dim)
+
+	var box := ColorRect.new()
+	box.position = Vector2(390, 170)
+	box.size = Vector2(500, 380)
+	box.color = Color(0.05, 0.08, 0.14, 0.98)
+	settings_panel.add_child(box)
+
+	var stitle := Label.new()
+	stitle.text = "EINSTELLUNGEN"
+	stitle.position = Vector2(390, 188)
+	stitle.size = Vector2(500, 36)
+	stitle.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	stitle.add_theme_color_override("font_color", Color(0.6, 0.95, 1.0))
+	stitle.add_theme_font_size_override("font_size", 26)
+	settings_panel.add_child(stitle)
+
+	# Name
+	var nl := Label.new()
+	nl.text = "Dein Name"
+	nl.position = Vector2(420, 250)
+	nl.add_theme_color_override("font_color", COL_TEXT)
+	nl.add_theme_font_size_override("font_size", 16)
+	settings_panel.add_child(nl)
+	name_edit = LineEdit.new()
+	name_edit.position = Vector2(420, 278)
+	name_edit.size = Vector2(440, 42)
+	name_edit.max_length = 18
+	name_edit.placeholder_text = "Pilot"
+	name_edit.add_theme_font_size_override("font_size", 18)
+	name_edit.text_changed.connect(_on_name_changed)
+	settings_panel.add_child(name_edit)
+
+	# Master volume
+	var vl := Label.new()
+	vl.text = "Lautstärke"
+	vl.position = Vector2(420, 340)
+	vl.add_theme_color_override("font_color", COL_TEXT)
+	vl.add_theme_font_size_override("font_size", 16)
+	settings_panel.add_child(vl)
+	vol_slider = HSlider.new()
+	vol_slider.position = Vector2(420, 372)
+	vol_slider.size = Vector2(440, 24)
+	vol_slider.min_value = -40.0
+	vol_slider.max_value = 6.0
+	vol_slider.step = 1.0
+	vol_slider.value = master_vol_db
+	vol_slider.value_changed.connect(_on_volume_changed)
+	settings_panel.add_child(vol_slider)
+
+	# Fullscreen
+	fullscreen_check = CheckBox.new()
+	fullscreen_check.text = "  Vollbild"
+	fullscreen_check.position = Vector2(420, 412)
+	fullscreen_check.add_theme_font_size_override("font_size", 16)
+	fullscreen_check.toggled.connect(_on_fullscreen_toggled)
+	settings_panel.add_child(fullscreen_check)
+
+	var back := Button.new()
+	back.text = "Zurück"
+	back.position = Vector2(490, 478)
+	back.size = Vector2(300, 48)
+	back.add_theme_font_size_override("font_size", 18)
+	back.pressed.connect(_close_settings)
+	settings_panel.add_child(back)
+
+# Toggle the ESC self-pause. Only openable during play. In co-op the world keeps
+# running but the server marks us busy (invulnerable + nothing spawns around us);
+# single-player fully freezes (see _process).
+func _toggle_esc_menu() -> void:
+	if state != STATE_PLAYING:
+		return
+	menu_open = not menu_open
+	esc_panel.visible = menu_open
+	if menu_open:
+		if settings_panel != null:
+			settings_panel.visible = false
+		if net_mode == NetMode.CLIENT and net_connected:
+			notify_busy.rpc_id(1, true)
+			request_roster.rpc_id(1)
+			request_highscores.rpc_id(1)
+		_refresh_esc_lists()
+	else:
+		if net_mode == NetMode.CLIENT and net_connected:
+			notify_busy.rpc_id(1, false)
+			p_invuln_timer = maxf(p_invuln_timer, 1.0)
+
+func _refresh_esc_lists() -> void:
+	if esc_roster_label != null:
+		esc_roster_label.text = _roster_text()
+	if esc_board_label != null:
+		esc_board_label.text = _highscore_text(14)
+
+func _open_settings() -> void:
+	if settings_panel == null:
+		return
+	if name_edit != null:
+		name_edit.text = player_name
+	if vol_slider != null:
+		vol_slider.value = master_vol_db
+	if fullscreen_check != null:
+		fullscreen_check.button_pressed = fullscreen_on
+	settings_panel.visible = true
+	settings_panel.move_to_front()   # ensure it draws above the ESC or home panel
+
+func _close_settings() -> void:
+	if settings_panel != null:
+		settings_panel.visible = false
+	player_name = _sanitize_name(player_name)
+	if net_mode == NetMode.CLIENT and net_connected:
+		set_player_name.rpc_id(1, player_name)
+	_save_settings()
+	_refresh_esc_lists()
+	if home_panel != null and home_panel.visible and home_name_edit != null:
+		home_name_edit.text = player_name
+
+func _on_name_changed(new_text: String) -> void:
+	player_name = new_text
+
+func _on_volume_changed(v: float) -> void:
+	master_vol_db = v
+	AudioServer.set_bus_volume_db(0, v)
+
+func _on_fullscreen_toggled(pressed: bool) -> void:
+	fullscreen_on = pressed
+	DisplayServer.window_set_mode(
+		DisplayServer.WINDOW_MODE_FULLSCREEN if pressed else DisplayServer.WINDOW_MODE_WINDOWED)
+
+# Roster text for the ESC screen. Single-player shows just the local pilot.
+func _roster_text() -> String:
+	if net_mode != NetMode.CLIENT:
+		return "● %s  (du)  —  Lv %d" % [player_name, p_level]
+	if not net_connected:
+		return "— nicht verbunden —"
+	if net_roster.is_empty():
+		return "— niemand online —"
+	var my_id := multiplayer.get_unique_id()
+	var ids: Array = net_roster.keys()
+	ids.sort()
+	var lines: Array = []
+	for id in ids:
+		var info: Dictionary = net_roster[id]
+		var nm: String = str(info.get("name", "Pilot"))
+		var lv: int = int(info.get("level", 1))
+		var me: String = "  (du)" if int(id) == my_id else ""
+		lines.append("●  %s%s  —  Lv %d" % [nm, me, lv])
+	return "\n".join(lines)
+
+# Formats the top `limit` highscore entries into a single multi-line string.
+func _highscore_text(limit: int) -> String:
+	if highscores.is_empty():
+		return "— noch keine Einträge —\nSei der Erste!"
+	var n: int = min(limit, highscores.size())
+	var lines: Array = []
+	for i in n:
+		var e: Dictionary = highscores[i]
+		var secs: int = int(e.get("time", 0))
+		var tstr := "%d:%02d" % [secs / 60, secs % 60]
+		var nm: String = str(e.get("name", "Pilot"))
+		lines.append("%d.  %s  —  Lv %d  ·  Welle %d  ·  %d Kills  ·  %s" % [
+			i + 1, nm, int(e.get("level", 1)), int(e.get("wave", 1)), int(e.get("kills", 0)), tstr])
+	return "\n".join(lines)
+
+# ============================================================
+# Home / start screen
+# ============================================================
+
+# Builds the start-screen overlay: title, pilot name (corner), personal best,
+# global leaderboard, server status + refresh, and the main action buttons. The
+# live 3D world (starfield + a slowly turning ship) shows through as the backdrop.
+func _build_home_panel() -> void:
+	home_panel = Control.new()
+	home_panel.size = Vector2(1280, 720)
+	home_panel.visible = false
+	hud.add_child(home_panel)
+
+	# Dark bands top & bottom keep text readable; the clear centre frames the ship.
+	var top_band := ColorRect.new()
+	top_band.size = Vector2(1280, 132)
+	top_band.color = Color(0.0, 0.01, 0.04, 0.8)
+	top_band.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	home_panel.add_child(top_band)
+	var bottom_band := ColorRect.new()
+	bottom_band.position = Vector2(0, 500)
+	bottom_band.size = Vector2(1280, 220)
+	bottom_band.color = Color(0.0, 0.01, 0.04, 0.8)
+	bottom_band.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	home_panel.add_child(bottom_band)
+
+	_home_label("STERNENFLUCHT", Vector2(0, 30), 56, Color(0.6, 0.95, 1.0), HORIZONTAL_ALIGNMENT_CENTER, 1280)
+	_home_label("Twin-Stick Roguelike", Vector2(0, 92), 15, COL_DIM, HORIZONTAL_ALIGNMENT_CENTER, 1280)
+
+	# Top-left: server status + manual refresh.
+	home_status_label = _home_label("Server: …", Vector2(40, 22), 16, COL_TEXT, HORIZONTAL_ALIGNMENT_LEFT, 380)
+	var refresh_btn := Button.new()
+	refresh_btn.text = "Aktualisieren"
+	refresh_btn.position = Vector2(40, 52)
+	refresh_btn.size = Vector2(140, 30)
+	refresh_btn.add_theme_font_size_override("font_size", 13)
+	refresh_btn.pressed.connect(_home_probe)
+	home_panel.add_child(refresh_btn)
+
+	# Top-right corner: pilot name.
+	_home_label("DEIN NAME", Vector2(1000, 22), 13, COL_DIM, HORIZONTAL_ALIGNMENT_RIGHT, 240)
+	home_name_edit = LineEdit.new()
+	home_name_edit.position = Vector2(1000, 46)
+	home_name_edit.size = Vector2(240, 38)
+	home_name_edit.max_length = 18
+	home_name_edit.placeholder_text = "Pilot"
+	home_name_edit.alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	home_name_edit.add_theme_font_size_override("font_size", 18)
+	home_name_edit.text_changed.connect(_on_name_changed)
+	home_panel.add_child(home_name_edit)
+
+	# Left: personal best.
+	var best_box := ColorRect.new()
+	best_box.position = Vector2(40, 150)
+	best_box.size = Vector2(360, 150)
+	best_box.color = Color(0.04, 0.07, 0.13, 0.55)
+	best_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	home_panel.add_child(best_box)
+	_home_label("DEIN REKORD", Vector2(60, 162), 18, Color(0.55, 0.95, 1.0), HORIZONTAL_ALIGNMENT_LEFT, 320)
+	home_best_label = _home_label("", Vector2(60, 196), 16, COL_TEXT, HORIZONTAL_ALIGNMENT_LEFT, 320)
+	home_best_label.size = Vector2(320, 96)
+
+	# Right: global leaderboard.
+	var brd_box := ColorRect.new()
+	brd_box.position = Vector2(880, 150)
+	brd_box.size = Vector2(360, 320)
+	brd_box.color = Color(0.04, 0.07, 0.13, 0.55)
+	brd_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	home_panel.add_child(brd_box)
+	_home_label("★ BESTENLISTE ★", Vector2(880, 162), 18, Color(1.0, 0.85, 0.45), HORIZONTAL_ALIGNMENT_CENTER, 360)
+	home_board_label = _home_label("", Vector2(898, 198), 12, COL_TEXT, HORIZONTAL_ALIGNMENT_LEFT, 324)
+	home_board_label.size = Vector2(324, 262)
+
+	# Bottom: primary actions — online play is the default (left, accented), offline secondary.
+	home_coop_btn = Button.new()
+	home_coop_btn.text = "Spielen"
+	home_coop_btn.position = Vector2(360, 536)
+	home_coop_btn.size = Vector2(260, 60)
+	home_coop_btn.add_theme_font_size_override("font_size", 22)
+	home_coop_btn.pressed.connect(_home_play_coop)
+	home_panel.add_child(home_coop_btn)
+	var sp_btn := Button.new()
+	sp_btn.text = "Offline-spielen"
+	sp_btn.position = Vector2(660, 536)
+	sp_btn.size = Vector2(260, 60)
+	sp_btn.add_theme_font_size_override("font_size", 22)
+	sp_btn.pressed.connect(_home_play_single)
+	home_panel.add_child(sp_btn)
+	var yard_btn := Button.new()
+	yard_btn.text = "Werkstatt"
+	yard_btn.position = Vector2(360, 612)
+	yard_btn.size = Vector2(176, 44)
+	yard_btn.add_theme_font_size_override("font_size", 16)
+	yard_btn.pressed.connect(_open_shipyard)
+	home_panel.add_child(yard_btn)
+	var set_btn := Button.new()
+	set_btn.text = "Einstellungen"
+	set_btn.position = Vector2(552, 612)
+	set_btn.size = Vector2(176, 44)
+	set_btn.add_theme_font_size_override("font_size", 16)
+	set_btn.pressed.connect(_open_settings)
+	home_panel.add_child(set_btn)
+	var quit_btn := Button.new()
+	quit_btn.text = "Beenden"
+	quit_btn.position = Vector2(744, 612)
+	quit_btn.size = Vector2(176, 44)
+	quit_btn.add_theme_font_size_override("font_size", 16)
+	quit_btn.pressed.connect(_home_quit)
+	home_panel.add_child(quit_btn)
+
+	_home_label("v" + GAME_VERSION, Vector2(1110, 698), 11, Color(0.45, 0.55, 0.7), HORIZONTAL_ALIGNMENT_RIGHT, 130)
+
+func _home_label(text: String, pos: Vector2, size: int, col: Color, align: int, width: float) -> Label:
+	var l := Label.new()
+	l.text = text
+	l.position = pos
+	l.size = Vector2(width, 28)
+	l.horizontal_alignment = align as HorizontalAlignment
+	l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	l.add_theme_color_override("font_color", col)
+	l.add_theme_font_size_override("font_size", size)
+	home_panel.add_child(l)
+	return l
+
+# ============================================================
+# Ship builder / hangar (STATE_SHIPYARD) — opened from the home screen.
+# ◀ ▶ cycle cosmetic ship_design options and rebuild the showcased ship live;
+# "Speichern" persists via _save_settings, "Verwerfen"/ESC restores the design
+# snapshot taken on open. Design keys are validated in _load_settings.
+# ============================================================
+func _build_shipyard_panel() -> void:
+	shipyard_panel = Control.new()
+	shipyard_panel.size = Vector2(1280, 720)
+	shipyard_panel.visible = false
+	hud.add_child(shipyard_panel)
+
+	# Dark control column on the left; the ship stays framed in the centre.
+	var col := ColorRect.new()
+	col.position = Vector2(40, 120)
+	col.size = Vector2(360, 470)
+	col.color = Color(0.0, 0.02, 0.06, 0.82)
+	col.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	shipyard_panel.add_child(col)
+
+	var title := Label.new()
+	title.text = "WERKSTATT"
+	title.position = Vector2(40, 134)
+	title.size = Vector2(360, 40)
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	title.add_theme_font_size_override("font_size", 30)
+	title.add_theme_color_override("font_color", Color(0.6, 0.95, 1.0))
+	shipyard_panel.add_child(title)
+
+	var hint := Label.new()
+	hint.text = "Gestalte dein Schiff – andere sehen es im Koop."
+	hint.position = Vector2(60, 176)
+	hint.size = Vector2(320, 44)
+	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hint.add_theme_font_size_override("font_size", 13)
+	hint.add_theme_color_override("font_color", COL_DIM)
+	shipyard_panel.add_child(hint)
+
+	shipyard_val_labels.clear()
+	_shipyard_row("palette", "Farbschema", 234)
+	_shipyard_row("wings", "Flügel", 320)
+
+	var save_btn := Button.new()
+	save_btn.text = "Speichern"
+	save_btn.position = Vector2(60, 514)
+	save_btn.size = Vector2(190, 46)
+	save_btn.add_theme_font_size_override("font_size", 18)
+	save_btn.pressed.connect(_shipyard_save)
+	shipyard_panel.add_child(save_btn)
+
+	var back_btn := Button.new()
+	back_btn.text = "Verwerfen"
+	back_btn.position = Vector2(262, 514)
+	back_btn.size = Vector2(118, 46)
+	back_btn.add_theme_font_size_override("font_size", 15)
+	back_btn.pressed.connect(_shipyard_cancel)
+	shipyard_panel.add_child(back_btn)
+
+# One editor row: category label + ◀ [value] ▶ at vertical offset y.
+func _shipyard_row(cat_key: String, title: String, y: float) -> void:
+	var lbl := Label.new()
+	lbl.text = title
+	lbl.position = Vector2(60, y)
+	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	lbl.add_theme_font_size_override("font_size", 15)
+	lbl.add_theme_color_override("font_color", COL_DIM)
+	shipyard_panel.add_child(lbl)
+
+	var left := Button.new()
+	left.text = "◀"
+	left.position = Vector2(60, y + 26)
+	left.size = Vector2(44, 40)
+	left.add_theme_font_size_override("font_size", 18)
+	left.pressed.connect(_shipyard_cycle.bind(cat_key, -1))
+	shipyard_panel.add_child(left)
+
+	var val := Label.new()
+	val.position = Vector2(108, y + 26)
+	val.size = Vector2(228, 40)
+	val.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	val.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	val.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	val.add_theme_font_size_override("font_size", 18)
+	val.add_theme_color_override("font_color", COL_TEXT)
+	shipyard_panel.add_child(val)
+	shipyard_val_labels[cat_key] = val
+
+	var right := Button.new()
+	right.text = "▶"
+	right.position = Vector2(340, y + 26)
+	right.size = Vector2(44, 40)
+	right.add_theme_font_size_override("font_size", 18)
+	right.pressed.connect(_shipyard_cycle.bind(cat_key, 1))
+	shipyard_panel.add_child(right)
+
+func _open_shipyard() -> void:
+	_shipyard_backup = ship_design.duplicate()
+	state = STATE_SHIPYARD
+	if home_panel != null:
+		home_panel.visible = false
+	if shipyard_panel != null:
+		shipyard_panel.visible = true
+	# Centre + spin the ship like the home turntable.
+	if p_node != null:
+		p_node.position = Vector3.ZERO
+	home_ship_spin = 0.0
+	_shipyard_refresh_labels()
+
+func _shipyard_cycle(cat_key: String, dir: int) -> void:
+	match cat_key:
+		"palette":
+			var pn: int = SHIP_PALETTES.size()
+			ship_design["palette"] = (int(ship_design.get("palette", 0)) + dir + pn) % pn
+		"wings":
+			var wn: int = SHIP_WING_OPTS.size()
+			var cur: int = SHIP_WING_OPTS.find(str(ship_design.get("wings", "swept")))
+			if cur < 0:
+				cur = 0
+			ship_design["wings"] = SHIP_WING_OPTS[(cur + dir + wn) % wn]
+	_rebuild_player_ship()
+	_shipyard_refresh_labels()
+
+func _shipyard_refresh_labels() -> void:
+	if shipyard_val_labels.has("palette"):
+		var pi: int = clampi(int(ship_design.get("palette", 0)), 0, SHIP_PALETTES.size() - 1)
+		shipyard_val_labels["palette"].text = str(SHIP_PALETTES[pi]["name"])
+	if shipyard_val_labels.has("wings"):
+		shipyard_val_labels["wings"].text = str(SHIP_WING_LABELS.get(str(ship_design.get("wings", "swept")), "—"))
+
+func _shipyard_save() -> void:
+	_save_settings()
+	_show_home()
+
+func _shipyard_cancel() -> void:
+	if ship_design != _shipyard_backup:
+		ship_design = _shipyard_backup.duplicate()
+		_rebuild_player_ship()
+	_show_home()
+
+# Frees and rebuilds the player ship from the current ship_design, preserving the
+# node's transform. Used live in the hangar on each option change.
+func _rebuild_player_ship() -> void:
+	var old_pos := p_pos
+	var old_rot := Vector3.ZERO
+	if p_node != null:
+		old_pos = p_node.position
+		old_rot = p_node.rotation
+		p_node.queue_free()
+	p_pulse_lights.clear()   # _assemble_ship_body re-appends; avoid stale freed refs
+	_build_player()
+	if p_node != null:
+		p_node.position = old_pos
+		p_node.rotation = old_rot
+
+# Switch to the home screen: hide the gameplay HUD + any overlay, show the menu,
+# refresh its content and kick off a fresh server reachability probe.
+func _show_home() -> void:
+	state = STATE_HOME
+	menu_open = false
+	if hud_game != null:
+		hud_game.visible = false
+	if levelup_panel != null:
+		levelup_panel.visible = false
+	if go_panel != null:
+		go_panel.visible = false
+	if esc_panel != null:
+		esc_panel.visible = false
+	if settings_panel != null:
+		settings_panel.visible = false
+	if shipyard_panel != null:
+		shipyard_panel.visible = false
+	if home_panel != null:
+		home_panel.visible = true
+	if home_name_edit != null:
+		home_name_edit.text = player_name
+	if home_coop_btn != null:
+		# Online play ("Spielen") is the default: always accented + focused (Enter starts it).
+		home_coop_btn.add_theme_color_override("font_color", Color(0.6, 1.0, 0.7))
+		home_coop_btn.grab_focus()
+	_refresh_home_best()
+	_refresh_home_board()
+	_home_probe()
+
+func _home_update(delta: float) -> void:
+	_animate_background(delta * 0.4)
+	# Slow turntable spin of the showcased ship.
+	if p_node != null:
+		home_ship_spin += delta * 0.4
+		p_node.rotation.z = home_ship_spin
+	# Keep the camera framed on the ship at the origin.
+	if cam != null:
+		cam.position = cam.position.lerp(cam_base_pos, clamp(delta * 4.0, 0.0, 1.0))
+		cam.look_at(Vector3.ZERO, Vector3.UP)
+	# Reachability probe: count down the connection / data-collection window.
+	if home_probing:
+		probe_timer -= delta
+		if probe_timer <= 0.0:
+			_home_probe_finish()
+
+func _refresh_home_best() -> void:
+	if home_best_label == null:
+		return
+	if best_level <= 0:
+		home_best_label.text = "Noch kein Lauf.\nStürz dich ins Getümmel!"
+	else:
+		home_best_label.text = "Level %d\nWelle %d   ·   %d Kills\nZeit %d:%02d" % [
+			best_level, best_wave, best_kills, best_time / 60, best_time % 60]
+
+func _refresh_home_board() -> void:
+	if home_board_label != null:
+		home_board_label.text = _highscore_text(13)
+
+# Lightweight reachability check: briefly connect, pull the roster + board, then
+# disconnect again. We do NOT stay connected or render the streamed world (guards
+# in spawn_enemy / receive_world / receive_bullets skip while home_probing).
+func _home_probe() -> void:
+	if home_probing:
+		return
+	if net_server_ip.is_empty():
+		net_server_ip = DEFAULT_SERVER
+	if multiplayer.multiplayer_peer != null:
+		multiplayer.multiplayer_peer.close()
+		multiplayer.multiplayer_peer = null
+	net_connected = false
+	net_roster.clear()
+	home_probing = true
+	probe_timer = 4.0   # connection timeout; shrinks to ~0.8s once connected
+	net_mode = NetMode.CLIENT   # so receive_roster / receive_highscores dispatch
+	if home_status_label != null:
+		home_status_label.text = "Server: verbinde …"
+	_start_client()
+
+func _home_probe_finish() -> void:
+	if not home_probing:
+		return
+	var was_connected := net_connected
+	var others: int = maxi(0, net_roster.size() - 1)
+	home_probing = false
+	if multiplayer.multiplayer_peer != null:
+		multiplayer.multiplayer_peer.close()
+		multiplayer.multiplayer_peer = null
+	net_connected = false
+	net_mode = NetMode.SINGLE
+	_coop_clear_world()   # drop anything that streamed in during the probe
+	if home_status_label != null:
+		home_status_label.text = ("● Server online  —  %d Spieler" % others) if was_connected else "○ Server offline"
+
+# Frees every client-mirrored entity (enemies / bullets / gems / remote players)
+# and clears the parallel arrays. Used before joining co-op and after a probe.
+func _coop_clear_world() -> void:
+	for d in [cl_enemies, cl_pbullets, cl_ebullets, cl_gems]:
+		for k in d.keys():
+			var ent = d[k]
+			if ent != null and ent.node != null:
+				ent.node.queue_free()
+		d.clear()
+	for id in remote_players.keys():
+		var rp = remote_players[id]
+		if rp != null and rp.get("node") != null:
+			rp["node"].queue_free()
+	remote_players.clear()
+	cl_designs.clear()
+	enemies.clear()
+	p_bullets.clear()
+	e_bullets.clear()
+	gems.clear()
+
+# Shared setup when leaving the home screen for a run.
+func _begin_play_common() -> void:
+	player_name = _sanitize_name(player_name)
+	if home_name_edit != null:
+		home_name_edit.text = player_name
+	_save_settings()
+	if home_panel != null:
+		home_panel.visible = false
+	if hud_game != null:
+		hud_game.visible = true
+	home_ship_spin = 0.0
+	if p_node != null:
+		p_node.rotation.z = 0.0
+
+func _home_play_single() -> void:
+	home_probing = false
+	if multiplayer.multiplayer_peer != null:
+		multiplayer.multiplayer_peer.close()
+		multiplayer.multiplayer_peer = null
+	net_connected = false
+	net_mode = NetMode.SINGLE
+	_begin_play_common()
+	# Local single-player board lives in the same file the server uses for its global one.
+	_coop_clear_world()
+	highscores = []
+	_load_highscores_server()
+	_restart_run()   # full clean local run; sets STATE_PLAYING
+
+func _home_play_coop() -> void:
+	home_probing = false
+	if multiplayer.multiplayer_peer != null:
+		multiplayer.multiplayer_peer.close()
+		multiplayer.multiplayer_peer = null
+	net_connected = false
+	if net_server_ip.is_empty():
+		net_server_ip = DEFAULT_SERVER
+	net_mode = NetMode.CLIENT
+	_begin_play_common()
+	_coop_clear_world()
+	_reset_player_progression()
+	p_pos = Vector3.ZERO
+	if p_node != null:
+		p_node.position = p_pos
+	run_time = 0.0
+	kills = 0
+	wave = 1
+	wave_timer = WAVE_DURATION
+	p_invuln_timer = maxf(p_invuln_timer, 2.0)
+	score_submitted = false
+	state = STATE_PLAYING
+	_start_client()
+
+func _home_quit() -> void:
+	if multiplayer.multiplayer_peer != null:
+		multiplayer.multiplayer_peer.close()
+	get_tree().quit()
+
+# True if a (level, wave, kills, time) run beats the stored personal best, using the
+# same ordering as the leaderboard (level → wave → kills → shorter time).
+func _is_better_run(lv: int, wv: int, kl: int, tm: int) -> bool:
+	if lv != best_level:
+		return lv > best_level
+	if wv != best_wave:
+		return wv > best_wave
+	if kl != best_kills:
+		return kl > best_kills
+	return tm < best_time
+
+func _update_personal_best() -> void:
+	var tm := int(run_time)
+	if best_level == 0 or _is_better_run(p_level, wave, kills, tm):
+		best_level = p_level
+		best_wave = wave
+		best_kills = kills
+		best_time = tm
+		_save_settings()
+
+# ============================================================
+# Settings persistence (client/single-player only)
+# ============================================================
+
+func _load_settings() -> void:
+	player_name = "Pilot-%d" % (randi() % 9000 + 1000)
+	ship_design = DEFAULT_SHIP_DESIGN.duplicate()
+	var cfg := ConfigFile.new()
+	if cfg.load(SETTINGS_FILE) == OK:
+		player_name = str(cfg.get_value("player", "name", player_name))
+		master_vol_db = float(cfg.get_value("audio", "master_db", 0.0))
+		fullscreen_on = bool(cfg.get_value("display", "fullscreen", false))
+		best_level = int(cfg.get_value("best", "level", 0))
+		best_wave = int(cfg.get_value("best", "wave", 0))
+		best_kills = int(cfg.get_value("best", "kills", 0))
+		best_time = int(cfg.get_value("best", "time", 0))
+		# Ship design — validate against the option tables so a hand-edited or
+		# stale file can never produce an out-of-range palette / unknown wing.
+		ship_design["palette"] = clampi(int(cfg.get_value("ship", "palette", 0)), 0, SHIP_PALETTES.size() - 1)
+		var w := str(cfg.get_value("ship", "wings", "swept"))
+		ship_design["wings"] = w if w in SHIP_WING_OPTS else "swept"
+	player_name = _sanitize_name(player_name)
+
+func _apply_settings() -> void:
+	AudioServer.set_bus_volume_db(0, master_vol_db)
+	if fullscreen_on:
+		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN)
+
+func _save_settings() -> void:
+	var cfg := ConfigFile.new()
+	cfg.set_value("player", "name", player_name)
+	cfg.set_value("audio", "master_db", master_vol_db)
+	cfg.set_value("display", "fullscreen", fullscreen_on)
+	cfg.set_value("best", "level", best_level)
+	cfg.set_value("best", "wave", best_wave)
+	cfg.set_value("best", "kills", best_kills)
+	cfg.set_value("best", "time", best_time)
+	cfg.set_value("ship", "palette", int(ship_design.get("palette", 0)))
+	cfg.set_value("ship", "wings", str(ship_design.get("wings", "swept")))
+	cfg.save(SETTINGS_FILE)
 
 # ============================================================
 # Self-updater — checks GitHub Releases, downloads the new exe, and
