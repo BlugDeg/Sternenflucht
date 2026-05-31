@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.7"
+const GAME_VERSION := "0.3.8"
 
 
 # Arena (in world units)
@@ -564,6 +564,8 @@ var cl_pbullets := {}
 var cl_ebullets := {}
 var cl_gems := {}
 var cl_designs := {}                  # client: id -> ship_design of each remote player (built into their mesh)
+var cl_upgrades := {}                 # client: id -> upgrade pick-counts of each remote player (visual growth)
+var up_counts: Dictionary = {}        # local: how many times each upgrade id was picked this run (synced)
 
 # Player identity + social
 var player_name: String = ""          # this client's chosen name (roster + highscore)
@@ -729,7 +731,7 @@ func _on_peer_connected(id: int) -> void:
 	# wave 100+ because the dedicated server simulates 24/7).
 	net_states[id] = {"pos": Vector3.ZERO, "yaw": 0.0, "invuln": 0.0, "busy": false,
 		"level": 1, "name": "Pilot", "wave": 1, "wave_timer": WAVE_DURATION,
-		"spawn_timer": 1.5, "kills": 0, "design": DEFAULT_SHIP_DESIGN.duplicate()}
+		"spawn_timer": 1.5, "kills": 0, "design": DEFAULT_SHIP_DESIGN.duplicate(), "upgrades": {}}
 	print("[MP] Spieler verbunden: %d  (online: %d)" % [id, net_states.size()])
 	_broadcast_roster()
 
@@ -1187,6 +1189,50 @@ func request_ship_designs() -> void:
 		return
 	receive_ship_designs.rpc_id(multiplayer.get_remote_sender_id(), _build_designs())
 
+# --- Upgrade visuals: pick-counts per player, so co-op partners see ships grow ---
+# Client reports its counts on each level-up pick; server stores + relays them, and
+# clients replay the matching _visual_* attachments onto that player's ship.
+@rpc("any_peer", "call_remote", "reliable")
+func submit_upgrades(counts: Dictionary) -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	var sender := multiplayer.get_remote_sender_id()
+	if not net_states.has(sender):
+		return
+	net_states[sender]["upgrades"] = _sanitize_upgrades(counts)
+	receive_upgrades.rpc(sender, net_states[sender]["upgrades"])
+
+# Clamp the pick-counts so a bad payload can't blow up the replay loops.
+func _sanitize_upgrades(c: Dictionary) -> Dictionary:
+	var out := {}
+	for key in ["proj", "rate", "dmg", "speed", "range", "pickup", "hp", "pierce", "boost_tank", "boost_str"]:
+		out[key] = clampi(int(c.get(key, 0)), 0, 99)
+	return out
+
+# A joining client pulls every connected player's current upgrade counts.
+@rpc("any_peer", "call_remote", "reliable")
+func request_upgrades() -> void:
+	if net_mode != NetMode.SERVER:
+		return
+	var who := multiplayer.get_remote_sender_id()
+	for id in net_states:
+		if id != who:
+			receive_upgrades.rpc_id(who, id, net_states[id].get("upgrades", {}))
+
+@rpc("authority", "call_remote", "reliable")
+func receive_upgrades(id: int, counts: Dictionary) -> void:
+	if net_mode != NetMode.CLIENT or home_probing:
+		return
+	if id == multiplayer.get_unique_id():
+		return   # our own ship grows locally as we pick
+	cl_upgrades[id] = counts
+	if remote_players.has(id):
+		_rebuild_remote_player(id)
+
+func _submit_upgrades() -> void:
+	if net_mode == NetMode.CLIENT and net_connected:
+		submit_upgrades.rpc_id(1, up_counts)
+
 # --- Emote relay: client picks → server validates → everyone shows it ---
 @rpc("any_peer", "call_remote", "reliable")
 func submit_emote(idx: int) -> void:
@@ -1340,6 +1386,8 @@ func _on_connected_to_server() -> void:
 		# build their custom ships as their snapshots arrive.
 		submit_ship_design.rpc_id(1, ship_design)
 		request_ship_designs.rpc_id(1)
+		submit_upgrades.rpc_id(1, up_counts)
+		request_upgrades.rpc_id(1)
 
 func _on_connection_failed() -> void:
 	net_connected = false
@@ -1356,6 +1404,7 @@ func _on_server_disconnected() -> void:
 		remote_players[id]["node"].queue_free()
 	remote_players.clear()
 	cl_designs.clear()
+	cl_upgrades.clear()
 	_clear_emotes()
 	for f in friendlies:
 		if f != null and f.node != null:
@@ -1410,7 +1459,7 @@ func _rebuild_remote_player(id: int) -> void:
 		pos = old.position
 		rot = old.rotation
 		old.queue_free()
-	var node := _build_ship_visual(cl_designs.get(id, DEFAULT_SHIP_DESIGN))
+	var node := _build_ship_visual(cl_designs.get(id, DEFAULT_SHIP_DESIGN), cl_upgrades.get(id, {}))
 	world.add_child(node)
 	node.position = pos
 	node.rotation = rot
@@ -1512,7 +1561,7 @@ func _apply_players(ids: PackedInt32Array, posv: PackedVector2Array, yawv: Packe
 		var pos: Vector3 = Vector3(posv[i].x, posv[i].y, 0)
 		var yaw: float = yawv[i]
 		if not remote_players.has(id):
-			var node := _build_ship_visual(cl_designs.get(id, DEFAULT_SHIP_DESIGN))
+			var node := _build_ship_visual(cl_designs.get(id, DEFAULT_SHIP_DESIGN), cl_upgrades.get(id, {}))
 			world.add_child(node)
 			node.position = pos
 			node.rotation = Vector3(0, 0, yaw)
@@ -1526,6 +1575,7 @@ func _apply_players(ids: PackedInt32Array, posv: PackedVector2Array, yawv: Packe
 			remote_players[id]["node"].queue_free()
 			remote_players.erase(id)
 			cl_designs.erase(id)
+			cl_upgrades.erase(id)
 			print("[MP] Mitspieler verschwunden: %d  (sichtbar: %d)" % [int(id), remote_players.size()])
 
 func _apply_enemy_positions(ids: PackedInt32Array, posv: PackedVector2Array) -> void:
@@ -1638,13 +1688,15 @@ func _client_net_update(delta: float) -> void:
 # Standalone copy of the player ship for a remote co-op player. Reuses the exact
 # geometry of _assemble_ship_body() by temporarily redirecting the member vars it
 # writes, then restoring them so the local player's ship is untouched.
-func _build_ship_visual(design: Dictionary = DEFAULT_SHIP_DESIGN) -> Node3D:
+func _build_ship_visual(design: Dictionary = DEFAULT_SHIP_DESIGN, upgrades: Dictionary = {}) -> Node3D:
 	var root := Node3D.new()
 	root.scale = Vector3.ONE * SHIP_SCALE_BASE
 	var sr := Node3D.new()
 	sr.rotation_degrees = Vector3(90, 0, 0)
 	root.add_child(sr)
 
+	# Save every member the base build + upgrade replay touch, so building a remote
+	# ship never clobbers our own ship/upgrade state. Restored at the end.
 	var s_render := ship_render
 	var s_pulse := p_pulse_lights
 	var s_ep := p_engine_mat_port
@@ -1653,15 +1705,41 @@ func _build_ship_visual(design: Dictionary = DEFAULT_SHIP_DESIGN) -> Node3D:
 	var s_egm := p_engine_glow_mat
 	var s_bf := p_boost_flame
 	var s_bfm := p_boost_flame_mat
-	# Remote ships are built from the peer's synced design. Swap the member around
-	# the build (which reads ship_design) so it doesn't clobber our own design.
 	var s_design := ship_design
-	ship_design = design
+	var s_guns := visual_guns
+	var s_engines := visual_engines
+	var s_armor := visual_armor
+	var s_sensors := visual_sensors
+	var s_coils := visual_rate_coils
+	var s_tanks := visual_boost_tanks
+	var s_nozzle := visual_boost_nozzle
+	var s_pierce := visual_pierce
+	var s_pickup := visual_pickup_ring
+	var s_dcore := visual_damage_core
+	var s_dlvl := visual_damage_lvl
+	var s_upm := u_pickup_mult
+	var s_upi := u_pierce
+	var s_ubs := u_boost_strength
 
+	# Build the base ship with the peer's design onto a throwaway state.
+	ship_design = design
 	ship_render = sr
 	p_pulse_lights = []   # throwaway — remote ships glow but don't pulse-animate
+	visual_guns = []
+	visual_engines = []
+	visual_armor = []
+	visual_sensors = []
+	visual_rate_coils = []
+	visual_boost_tanks = []
+	visual_boost_nozzle = null
+	visual_pierce = null
+	visual_pickup_ring = null
+	visual_damage_core = null
+	visual_damage_lvl = 0
 	_assemble_ship_body()
+	_replay_upgrade_visuals(upgrades)   # grow the ship by the peer's upgrade picks
 
+	# Restore our own state.
 	ship_design = s_design
 	ship_render = s_render
 	p_pulse_lights = s_pulse
@@ -1671,7 +1749,54 @@ func _build_ship_visual(design: Dictionary = DEFAULT_SHIP_DESIGN) -> Node3D:
 	p_engine_glow_mat = s_egm
 	p_boost_flame = s_bf
 	p_boost_flame_mat = s_bfm
+	visual_guns = s_guns
+	visual_engines = s_engines
+	visual_armor = s_armor
+	visual_sensors = s_sensors
+	visual_rate_coils = s_coils
+	visual_boost_tanks = s_tanks
+	visual_boost_nozzle = s_nozzle
+	visual_pierce = s_pierce
+	visual_pickup_ring = s_pickup
+	visual_damage_core = s_dcore
+	visual_damage_lvl = s_dlvl
+	u_pickup_mult = s_upm
+	u_pierce = s_upi
+	u_boost_strength = s_ubs
 	return root
+
+# Re-create a peer's upgrade attachments on the current ship_render from their
+# synced pick-counts (keys = upgrade ids). Assumes visual_* were reset by the
+# caller. The "set/grow" visuals read u_* — set those from the counts first.
+func _replay_upgrade_visuals(u: Dictionary) -> void:
+	if u.is_empty():
+		return
+	for i in int(u.get("proj", 0)):
+		_visual_add_gun()
+	for i in int(u.get("rate", 0)):
+		_visual_add_rate_coil()
+	for i in int(u.get("speed", 0)):
+		_visual_add_engine()
+	for i in int(u.get("range", 0)):
+		_visual_add_sensor()
+	for i in int(u.get("hp", 0)):
+		_visual_add_armor()
+	for i in int(u.get("boost_tank", 0)):
+		_visual_add_boost_tank()
+	for i in int(u.get("dmg", 0)):
+		_visual_grow_damage_core()
+	var pk: int = int(u.get("pickup", 0))
+	if pk > 0:
+		u_pickup_mult = pow(1.40, pk)
+		_visual_set_pickup_ring()
+	var pir: int = int(u.get("pierce", 0))
+	if pir > 0:
+		u_pierce = pir
+		_visual_set_pierce_lance()
+	var nz: int = int(u.get("boost_str", 0))
+	if nz > 0:
+		u_boost_strength = 1.8 + 0.25 * nz
+		_visual_add_boost_nozzle()
 
 func _build_audio() -> void:
 	# Procedural laser zap — descending frequency, exponential decay envelope.
@@ -6453,6 +6578,9 @@ func _on_levelup_pick(idx: int) -> void:
 		return
 	var up: Dictionary = btn.get_meta("upgrade")
 	up["apply"].call()
+	# Track + sync the pick count so co-op partners see our ship grow the same parts.
+	up_counts[up["id"]] = int(up_counts.get(up["id"], 0)) + 1
+	_submit_upgrades()
 	levelup_panel.visible = false
 	state = STATE_PLAYING
 	# Resume server-side damage, but keep a short grace window so we're not instantly
@@ -6616,6 +6744,7 @@ func _reset_player_progression() -> void:
 	boost_charge = 1.0
 	boosting = false
 	boost_depleted = false
+	up_counts = {}   # fresh run → no upgrade visuals (synced to others)
 
 func _restart_run() -> void:
 	for e in enemies:
@@ -7976,6 +8105,7 @@ func _coop_clear_world() -> void:
 			rp["node"].queue_free()
 	remote_players.clear()
 	cl_designs.clear()
+	cl_upgrades.clear()
 	_clear_emotes()
 	for f in friendlies:
 		if f != null and f.node != null:
