@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.10"
+const GAME_VERSION := "0.3.11"
 
 
 # Arena (in world units)
@@ -1845,7 +1845,12 @@ func _client_net_update(delta: float) -> void:
 # writes, then restoring them so the local player's ship is untouched.
 func _build_ship_visual(design: Dictionary = DEFAULT_SHIP_DESIGN, upgrades: Dictionary = {}) -> Node3D:
 	var root := Node3D.new()
-	root.scale = Vector3.ONE * SHIP_SCALE_BASE
+	# Match the local player's physical size: p_node is scaled by SHIP_SCALE_BASE * u_range_mult,
+	# and range upgrades grow u_range_mult by 1.25 each (the ship gets physically bigger; the
+	# owner's camera zooms out to compensate). Remote viewers must apply the SAME range factor
+	# or range-upgraded ships render too small. Derived from the synced upgrade pick-counts.
+	var range_mult: float = pow(1.25, int(upgrades.get("range", 0)))
+	root.scale = Vector3.ONE * SHIP_SCALE_BASE * range_mult
 	var sr := Node3D.new()
 	sr.rotation_degrees = Vector3(90, 0, 0)
 	root.add_child(sr)
