@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.5"
+const GAME_VERSION := "0.3.6"
 
 
 # Arena (in world units)
@@ -598,6 +598,7 @@ var chat_messages: Array = []              # formatted "Name: text" history
 
 # --- World events (server + single-player authority) ---
 var active_event: String = ""              # "", "mega", "escort" — one at a time
+var last_event_kind: String = ""           # last started event → alternate so neither dominates
 var event_timer: float = 45.0              # countdown to the next world event
 var mega_active = null                     # Entity ref of the live mega-boss
 var escort_bot = null                      # Entity (friendly) of the rescued pilot
@@ -4065,17 +4066,21 @@ func _update_events(delta: float) -> void:
 		center = p_pos
 		lvl = p_level
 		wn = wave
-	# The mega-boss needs a higher level; otherwise (or 50/50 above it) run the escort.
-	if lvl >= MEGA_MIN_LEVEL and randf() < 0.5:
-		_start_mega(center, wn)
-	else:
+	# Alternate event types so neither dominates (the boss kept monopolising). The
+	# mega-boss needs a higher level; below it — and after any non-escort event,
+	# incl. the very first — run the escort. So: escort → mega → escort → …
+	var can_mega: bool = lvl >= MEGA_MIN_LEVEL
+	if not can_mega or last_event_kind != "escort":
 		_start_escort(center, wn)
+	else:
+		_start_mega(center, wn)
 
 func _start_mega(center: Vector3, wn: int) -> void:
 	var ang: float = randf() * TAU
 	var pos: Vector3 = center + Vector3(cos(ang), sin(ang), 0) * randf_range(MEGA_SPAWN_MIN, MEGA_SPAWN_MAX)
 	mega_active = _spawn_enemy("boss", pos, wn, true)
 	active_event = "mega"
+	last_event_kind = "mega"
 	_event_announce("⚠ ANOMALIE GEORTET — ein gewaltiger Gegner lauert. Folge dem Radar!")
 
 # A friendly pilot pinned down by marked shooters — escort/rescue event.
@@ -4093,6 +4098,7 @@ func _start_escort(center: Vector3, wn: int) -> void:
 	escort_timer = ESCORT_TIME
 	escort_obj_accum = 0.0
 	active_event = "escort"
+	last_event_kind = "escort"
 	_event_announce("🆘 NOTRUF — ein Pilot wird angegriffen! Räum die markierten Gegner aus, bevor er fällt!")
 
 func _update_escort(delta: float) -> void:
@@ -4862,11 +4868,11 @@ const MEGA_GEMS := 40                       # loot shower on kill
 # Event A — Rescue Escort: a friendly bot pinned down by marked shooters. Clear
 # them before the timer runs out or the bot dies → loot.
 const ESCORT_MIN_LEVEL := 4
-const ESCORT_SPAWN_MIN := 95.0
-const ESCORT_SPAWN_MAX := 150.0
+const ESCORT_SPAWN_MIN := 70.0              # closer than the mega so it's reachable in time
+const ESCORT_SPAWN_MAX := 120.0
 const ESCORT_DETECT := 220.0                # radar reveal range for the bot
 const ESCORT_BOT_HP := 700                  # bot HP (drained by the markers' fire)
-const ESCORT_TIME := 50.0                   # seconds to clear the markers
+const ESCORT_TIME := 90.0                   # seconds to reach + clear the markers
 const ESCORT_MARKERS := 6                   # number of marked shooters
 const ESCORT_GEMS := 30                     # loot shower on success
 # Shared event cadence (one world event — mega OR escort — at a time).
