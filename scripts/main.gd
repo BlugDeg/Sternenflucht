@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.3"
+const GAME_VERSION := "0.3.4"
 
 
 # Arena (in world units)
@@ -97,6 +97,7 @@ class Entity:
 	# Multiplayer fields
 	var net_id: int = 0       # server-assigned network id (0 = local/single-player)
 	var is_mega: bool = false # enemy: special hidden mega-boss world event (radar marker + big reward)
+	var marked: bool = false  # enemy: part of an escort event — targets the rescued bot, not the player
 	var dna: Dictionary = {}  # enemy: procedural recipe, sent to clients so they rebuild the mesh
 	var owner_id: int = 0     # player bullet: peer id of the player who fired it
 	var tpos: Vector3 = Vector3.ZERO  # client: target position from the latest snapshot (lerp toward)
@@ -320,6 +321,27 @@ class RadarPanel extends Control:
 				ang_e = atan2(dir2.y, dir2.x)
 				var fade_col: Color = Color(col.r, col.g, col.b, 0.55)
 				_draw_blip(pt, fade_col, sz * 0.75, 0.4 + _sweep_intensity(ang_e) * 0.6)
+
+		# Rescued bot (escort event) — green marker / rim arrow, like the mega cue.
+		for f in main.friendlies:
+			if f.dead:
+				continue
+			var dxyf: Vector3 = f.pos - p_pos
+			var df: float = dxyf.length()
+			if df > 220.0:
+				continue
+			var pulsf: float = 0.5 + 0.5 * sin(t_accum * 4.0)
+			var fcol := Color(0.4, 1.0, 0.55)
+			if df <= world_range:
+				var fp := Vector2(r + dxyf.x * scale_factor, r - dxyf.y * scale_factor)
+				draw_arc(fp, 7.0 + pulsf * 3.0, 0.0, TAU, 24, Color(0.5, 1.0, 0.6, 0.85), 2.0)
+				_draw_blip(fp, fcol, 4.0, 0.8 + pulsf)
+			else:
+				var dirf := Vector2(dxyf.x, -dxyf.y).normalized()
+				var atf := c + dirf * (r - 5.0)
+				_draw_blip(atf, fcol, 3.6, 0.5 + pulsf)
+				var perpf := Vector2(-dirf.y, dirf.x)
+				draw_polygon(PackedVector2Array([atf + dirf * 6.0, atf - dirf * 3.0 + perpf * 3.5, atf - dirf * 3.0 - perpf * 3.5]), PackedColorArray([Color(0.5, 1.0, 0.6, 0.9)]))
 
 		# Other players — always pinned to the rim with a directional arrow,
 		# regardless of distance, so the party can find each other.
@@ -574,10 +596,19 @@ var chat_typing: bool = false              # input focused → movement/fire/whe
 var chat_messages: Array = []              # formatted "Name: text" history
 
 # --- World events (server + single-player authority) ---
-var mega_active = null                     # Entity ref of the live mega-boss (null = none)
-var mega_timer: float = 45.0               # countdown to the next mega event
+var active_event: String = ""              # "", "mega", "escort" — one at a time
+var event_timer: float = 45.0              # countdown to the next world event
+var mega_active = null                     # Entity ref of the live mega-boss
+var escort_bot = null                      # Entity (friendly) of the rescued pilot
+var escort_markers: Array = []             # Entity refs of the marked attacker enemies
+var escort_timer: float = 0.0              # rescue time limit countdown
+var escort_pos: Vector3 = Vector3.ZERO     # bot location (markers target this)
+var escort_obj_accum: float = 0.0          # throttle for the objective broadcast
+var friendlies: Array = []                 # Entity refs of friendly bots (server logic + render)
+var cl_friendlies: Dictionary = {}         # client: net_id -> friendly Entity
 var announce_label: Label = null           # transient centre-top HUD banner
 var announce_timer: float = 0.0
+var objective_label: Label = null          # persistent objective line during an event
 var home_probing: bool = false          # a lightweight reachability probe is in flight
 var probe_timer: float = 0.0            # connection timeout, shrinks once connected
 var home_ship_spin: float = 0.0         # turntable angle for the showcased ship
@@ -684,8 +715,7 @@ func _on_peer_disconnected(id: int) -> void:
 		p_bullets.clear()
 		e_bullets.clear()
 		gems.clear()
-		mega_active = null
-		mega_timer = randf_range(MEGA_INTERVAL_MIN, MEGA_INTERVAL_MAX)
+		_reset_events()
 	print("[MP] Spieler getrennt: %d  (online: %d)" % [id, net_states.size()])
 	_broadcast_roster()
 
@@ -738,7 +768,8 @@ func _server_update_enemies(delta: float) -> void:
 		if e.dead:
 			continue
 		e.hit_flash = max(0.0, e.hit_flash - delta * 4.0)
-		var tgt: Vector3 = _nearest_player_pos(e.pos)
+		# Marked escort attackers target the rescued bot, not the player.
+		var tgt: Vector3 = escort_pos if e.marked else _nearest_player_pos(e.pos)
 		match e.type:
 			"drone":
 				_ai_chase(e, delta, 5.0, tgt)
@@ -869,6 +900,16 @@ func _server_resolve_collisions() -> void:
 				_server_hit_player(id, b.damage)
 				b.dead = true
 				break
+	# Enemy bullets vs the rescued bot (escort event).
+	if escort_bot != null and not escort_bot.dead:
+		for b in e_bullets:
+			if b.dead:
+				continue
+			if b.pos.distance_to(escort_bot.pos) <= escort_bot.radius + b.radius:
+				escort_bot.hp -= b.damage
+				b.dead = true
+				if escort_bot.hp <= 0:
+					escort_bot.dead = true
 	# Enemy bodies vs each player.
 	for e in enemies:
 		if e.dead:
@@ -1288,6 +1329,12 @@ func _on_server_disconnected() -> void:
 	remote_players.clear()
 	cl_designs.clear()
 	_clear_emotes()
+	for f in friendlies:
+		if f != null and f.node != null:
+			f.node.queue_free()
+	friendlies.clear()
+	cl_friendlies.clear()
+	_apply_objective("")
 	net_roster.clear()
 	if menu_open:
 		_refresh_esc_lists()
@@ -3717,19 +3764,21 @@ func _update_enemies(delta: float) -> void:
 		if e.dead:
 			continue
 		e.hit_flash = max(0.0, e.hit_flash - delta * 4.0)
+		# Marked escort attackers target the rescued bot, not the player.
+		var tgt: Vector3 = escort_pos if e.marked else p_pos
 		match e.type:
 			"drone":
-				_ai_chase(e, delta, 5.0, p_pos)
+				_ai_chase(e, delta, 5.0, tgt)
 			"shooter":
-				_ai_keep_distance(e, delta, 4.2, 11.0, p_pos)
-				_ai_shoot(e, delta, 8, 9.5, p_pos)
+				_ai_keep_distance(e, delta, 4.2, 11.0, tgt)
+				_ai_shoot(e, delta, 8, 9.5, tgt)
 			"tank":
-				_ai_chase(e, delta, 2.8, p_pos)
+				_ai_chase(e, delta, 2.8, tgt)
 			"boss":
 				if e.is_mega and p_pos.distance_to(e.pos) > MEGA_WAKE:
 					e.vel = e.vel.lerp(Vector3.ZERO, clamp(delta * 2.0, 0.0, 1.0))   # lurk until found
 				else:
-					_ai_boss(e, delta, p_pos)
+					_ai_boss(e, delta, tgt)
 		e.pos += e.vel * delta
 		_clamp_to_arena(e)
 		if e.node != null:
@@ -3929,8 +3978,8 @@ func _spawn_enemy(kind: String, pos: Vector3, wave_n: int = -1, mega: bool = fal
 	# Mega-boss stat overrides (radius already 5x via the scaled size above).
 	if mega:
 		e.is_mega = true
-		e.hp = e.hp * int(MEGA_SCALE); e.max_hp = e.hp
-		e.damage = maxi(e.damage, 55)
+		e.hp = e.hp * MEGA_HP_MULT; e.max_hp = e.hp   # a real, drawn-out fight
+		e.damage = MEGA_DAMAGE
 		e.shoot_cd = 0.8
 	e.dna = dna
 	# Server: headless authority — assign a network id and tell clients to build
@@ -3980,40 +4029,130 @@ func _spawn_boss_wave() -> void:
 func _update_events(delta: float) -> void:
 	if net_mode == NetMode.CLIENT:
 		return
-	# A mega-boss event runs until its entity dies, then a new countdown starts.
-	if mega_active != null:
-		if mega_active.dead:
-			mega_active = null
-			mega_timer = randf_range(MEGA_INTERVAL_MIN, MEGA_INTERVAL_MAX)
+	match active_event:
+		"mega":
+			if mega_active == null or mega_active.dead:
+				_end_event()
+			return
+		"escort":
+			_update_escort(delta)
+			return
+	# No active event → count down, then start a random eligible one.
+	event_timer -= delta
+	if event_timer > 0.0:
 		return
-	mega_timer -= delta
-	if mega_timer > 0.0:
-		return
-	mega_timer = randf_range(MEGA_INTERVAL_MIN, MEGA_INTERVAL_MAX)
-	# Eligible centre (a high-enough-level player) + its wave for scaling.
+	event_timer = randf_range(EVENT_INTERVAL_MIN, EVENT_INTERVAL_MAX)
 	var center: Vector3
+	var lvl: int
 	var wn: int
 	if net_mode == NetMode.SERVER:
 		var ids: Array = []
 		for id in net_states:
-			if not net_states[id].get("busy", false) and int(net_states[id].get("level", 1)) >= MEGA_MIN_LEVEL:
+			if not net_states[id].get("busy", false) and int(net_states[id].get("level", 1)) >= ESCORT_MIN_LEVEL:
 				ids.append(id)
 		if ids.is_empty():
 			return
 		var pid: int = ids[randi() % ids.size()]
 		center = net_states[pid]["pos"]
+		lvl = int(net_states[pid].get("level", 1))
 		wn = int(net_states[pid].get("wave", 1))
 	else:
-		if p_level < MEGA_MIN_LEVEL:
+		if p_level < ESCORT_MIN_LEVEL:
 			return
 		center = p_pos
+		lvl = p_level
 		wn = wave
-	# Hide it far away in a random direction — well beyond radar range, so the
-	# player has to track it down via the radar marker.
+	# The mega-boss needs a higher level; otherwise (or 50/50 above it) run the escort.
+	if lvl >= MEGA_MIN_LEVEL and randf() < 0.5:
+		_start_mega(center, wn)
+	else:
+		_start_escort(center, wn)
+
+func _start_mega(center: Vector3, wn: int) -> void:
 	var ang: float = randf() * TAU
 	var pos: Vector3 = center + Vector3(cos(ang), sin(ang), 0) * randf_range(MEGA_SPAWN_MIN, MEGA_SPAWN_MAX)
 	mega_active = _spawn_enemy("boss", pos, wn, true)
-	_event_announce("⚠ ANOMALIE GEORTET — ein gewaltiger Gegner lauert in der Nähe. Folge dem Radar!")
+	active_event = "mega"
+	_event_announce("⚠ ANOMALIE GEORTET — ein gewaltiger Gegner lauert. Folge dem Radar!")
+
+# A friendly pilot pinned down by marked shooters — escort/rescue event.
+func _start_escort(center: Vector3, wn: int) -> void:
+	var ang: float = randf() * TAU
+	escort_pos = center + Vector3(cos(ang), sin(ang), 0) * randf_range(ESCORT_SPAWN_MIN, ESCORT_SPAWN_MAX)
+	escort_bot = _spawn_friendly(escort_pos, ESCORT_BOT_HP)
+	escort_markers.clear()
+	for i in ESCORT_MARKERS:
+		var ma: float = float(i) / float(ESCORT_MARKERS) * TAU + randf_range(-0.3, 0.3)
+		var mp: Vector3 = escort_pos + Vector3(cos(ma), sin(ma), 0) * randf_range(5.0, 10.0)
+		var me := _spawn_enemy("shooter", mp, wn)
+		me.marked = true
+		escort_markers.append(me)
+	escort_timer = ESCORT_TIME
+	escort_obj_accum = 0.0
+	active_event = "escort"
+	_event_announce("🆘 NOTRUF — ein Pilot wird angegriffen! Räum die markierten Gegner aus, bevor er fällt!")
+
+func _update_escort(delta: float) -> void:
+	escort_timer -= delta
+	# Fail: the bot was destroyed.
+	if escort_bot == null or escort_bot.dead:
+		_event_announce("💀 Der Pilot wurde zerstört … Rettung gescheitert.")
+		_escort_finish(false)
+		return
+	# Count surviving markers.
+	var alive: int = 0
+	for m in escort_markers:
+		if m != null and not m.dead:
+			alive += 1
+	# Success: all markers cleared in time.
+	if alive == 0:
+		for i in ESCORT_GEMS:
+			_spawn_gem(escort_pos + Vector3(randf_range(-1.5, 1.5), randf_range(-1.5, 1.5), 0), 50)
+		_event_announce("✅ PILOT GERETTET — fette Beute als Dank!")
+		_escort_finish(true)
+		return
+	# Fail: time up.
+	if escort_timer <= 0.0:
+		_event_announce("⏱ Zeit abgelaufen … der Pilot flieht.")
+		_escort_finish(false)
+		return
+	# Live objective line (throttled to ~2 Hz).
+	escort_obj_accum -= delta
+	if escort_obj_accum <= 0.0:
+		escort_obj_accum = 0.5
+		var hp_frac: int = int(round(100.0 * float(escort_bot.hp) / float(maxi(1, escort_bot.max_hp))))
+		_set_objective("🆘 Rettung — Pilot %d%%  ·  %d Gegner  ·  %ds" % [hp_frac, alive, int(ceil(escort_timer))])
+
+func _escort_finish(_success: bool) -> void:
+	# Remove any surviving markers (no loot) and end the event.
+	for m in escort_markers:
+		if m != null and not m.dead:
+			_despawn_enemy_entity(m)
+	escort_markers.clear()
+	_end_event()
+
+# Tear down the active event and arm the next countdown.
+func _end_event() -> void:
+	if escort_bot != null:
+		_despawn_friendly_entity(escort_bot)
+		escort_bot = null
+	mega_active = null
+	active_event = ""
+	event_timer = randf_range(EVENT_INTERVAL_MIN, EVENT_INTERVAL_MAX)
+	_set_objective("")
+
+# Hard reset of all event state (world reset / restart) — no rewards.
+func _reset_events() -> void:
+	for f in friendlies.duplicate():
+		_despawn_friendly_entity(f)
+	friendlies.clear()
+	escort_bot = null
+	escort_markers.clear()
+	mega_active = null
+	active_event = ""
+	escort_timer = 0.0
+	event_timer = randf_range(EVENT_INTERVAL_MIN, EVENT_INTERVAL_MAX)
+	_set_objective("")
 
 # Show a transient banner: broadcast from the server, local on single-player.
 func _event_announce(text: String) -> void:
@@ -4034,6 +4173,117 @@ func _show_announce(text: String) -> void:
 	announce_label.text = text
 	announce_label.visible = true
 	announce_timer = 6.0
+
+# Persistent objective line (live timer / count during an event); "" hides it.
+func _set_objective(text: String) -> void:
+	if net_mode == NetMode.SERVER:
+		receive_objective.rpc(text)
+	else:
+		_apply_objective(text)
+
+@rpc("authority", "call_remote", "reliable")
+func receive_objective(text: String) -> void:
+	if net_mode != NetMode.CLIENT or home_probing:
+		return
+	_apply_objective(text)
+
+func _apply_objective(text: String) -> void:
+	if objective_label == null:
+		return
+	objective_label.text = text
+	objective_label.visible = not text.is_empty()
+
+# ---- Friendly bot (escort event): a synced non-enemy entity. ----
+func _spawn_friendly(pos: Vector3, hp: int) -> Entity:
+	var e := Entity.new()
+	e.type = "friendly"
+	e.pos = pos
+	e.hp = hp
+	e.max_hp = hp
+	e.radius = 1.6
+	if net_mode == NetMode.SERVER:
+		e.net_id = _next_net_id()
+		friendlies.append(e)
+		spawn_friendly.rpc(e.net_id, pos)
+		return e
+	e.node = _build_friendly_mesh()
+	e.node.position = pos
+	world.add_child(e.node)
+	friendlies.append(e)
+	return e
+
+# Free a friendly bot: tell clients (server) or drop the local node (single).
+func _despawn_friendly_entity(e) -> void:
+	if e == null:
+		return
+	e.dead = true
+	if net_mode == NetMode.SERVER:
+		despawn_friendly.rpc(e.net_id)
+	elif e.node != null:
+		e.node.queue_free()
+	friendlies.erase(e)
+
+@rpc("authority", "call_remote", "reliable")
+func spawn_friendly(net_id: int, pos: Vector3) -> void:
+	if net_mode != NetMode.CLIENT or home_probing:
+		return
+	if cl_friendlies.has(net_id):
+		return
+	var e := Entity.new()
+	e.type = "friendly"
+	e.net_id = net_id
+	e.pos = pos
+	e.tpos = pos
+	e.radius = 1.6
+	e.node = _build_friendly_mesh()
+	e.node.position = pos
+	world.add_child(e.node)
+	cl_friendlies[net_id] = e
+	friendlies.append(e)
+
+@rpc("authority", "call_remote", "reliable")
+func despawn_friendly(net_id: int) -> void:
+	if net_mode != NetMode.CLIENT or not cl_friendlies.has(net_id):
+		return
+	var e: Entity = cl_friendlies[net_id]
+	if e.node != null:
+		e.node.queue_free()
+	e.dead = true
+	cl_friendlies.erase(net_id)
+	friendlies.erase(e)
+
+# Distinct ally craft: reuse the player ship visual in a green palette + a
+# distress beacon and a floating SOS marker.
+func _build_friendly_mesh() -> Node3D:
+	var root := _build_ship_visual({"palette": 2, "wings": "delta", "engines": 2, "tail": "twin", "nose": "pointed", "leds": "green"})
+	root.scale *= 1.5
+	var beacon := OmniLight3D.new()
+	beacon.light_color = Color(0.4, 1.0, 0.55)
+	beacon.light_energy = 2.5
+	beacon.omni_range = 12.0
+	root.add_child(beacon)
+	if emoji_font != null:
+		var lbl := Label3D.new()
+		lbl.text = "🆘"
+		lbl.font = emoji_font
+		lbl.font_size = 120
+		lbl.pixel_size = 0.011
+		lbl.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		lbl.no_depth_test = true
+		lbl.render_priority = 9
+		lbl.position = Vector3(0, 0, 3.0)
+		root.add_child(lbl)
+	return root
+
+# Remove an enemy with no loot/score (event cleanup).
+func _despawn_enemy_entity(e) -> void:
+	if e == null:
+		return
+	e.dead = true
+	if net_mode == NetMode.SERVER:
+		despawn_enemy.rpc(e.net_id)
+	elif e.node != null:
+		e.node.queue_free()
 
 func _make_enemy_mesh(kind: String) -> Node3D:
 	var root := Node3D.new()
@@ -4562,8 +4812,25 @@ const MEGA_SPAWN_MIN := 110.0               # how far from a player it hides (we
 const MEGA_SPAWN_MAX := 165.0
 const MEGA_DETECT := 220.0                  # radar reveals it within this range (hidden beyond)
 const MEGA_WAKE := 75.0                     # stays dormant until a player is this close
-const MEGA_SCALE := 5.0                     # 5x size/HP vs a normal boss
+const MEGA_SCALE := 5.0                     # 5x size vs a normal boss (visual)
+const MEGA_HP_MULT := 60                    # HP vs a normal boss — high, since its huge
+                                            # radius lets piercing shots multi-hit it hard
+const MEGA_DAMAGE := 45                     # contact/shot damage (threatening, not instakill)
 const MEGA_GEMS := 40                       # loot shower on kill
+
+# Event A — Rescue Escort: a friendly bot pinned down by marked shooters. Clear
+# them before the timer runs out or the bot dies → loot.
+const ESCORT_MIN_LEVEL := 4
+const ESCORT_SPAWN_MIN := 95.0
+const ESCORT_SPAWN_MAX := 150.0
+const ESCORT_DETECT := 220.0                # radar reveal range for the bot
+const ESCORT_BOT_HP := 700                  # bot HP (drained by the markers' fire)
+const ESCORT_TIME := 50.0                   # seconds to clear the markers
+const ESCORT_MARKERS := 6                   # number of marked shooters
+const ESCORT_GEMS := 30                     # loot shower on success
+# Shared event cadence (one world event — mega OR escort — at a time).
+const EVENT_INTERVAL_MIN := 80.0
+const EVENT_INTERVAL_MAX := 150.0
 
 func _make_proc_hull_mat(c: Color) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
@@ -5320,6 +5587,17 @@ func _resolve_collisions() -> void:
 					_kill_enemy(e)
 				if b.dead:
 					break
+
+	# Enemy bullets vs the rescued bot (escort event) — independent of player i-frames.
+	if escort_bot != null and not escort_bot.dead:
+		for b in e_bullets:
+			if b.dead:
+				continue
+			if b.pos.distance_to(escort_bot.pos) <= escort_bot.radius + b.radius:
+				escort_bot.hp -= b.damage
+				b.dead = true
+				if escort_bot.hp <= 0:
+					escort_bot.dead = true
 
 	if p_invuln_timer <= 0.0:
 		for b in e_bullets:
@@ -6106,8 +6384,7 @@ func _restart_run() -> void:
 	p_bullets.clear()
 	e_bullets.clear()
 	gems.clear()
-	mega_active = null
-	mega_timer = randf_range(MEGA_INTERVAL_MIN, MEGA_INTERVAL_MAX)
+	_reset_events()
 	_reset_player_progression()
 	p_pos = Vector3.ZERO
 	wave = 1
@@ -6383,6 +6660,11 @@ func _build_hud() -> void:
 	announce_label.size = Vector2(1000, 28)
 	announce_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	announce_label.visible = false
+	# Persistent objective line (live during an event) — shown by _set_objective.
+	objective_label = _hud_label("", Vector2(140, 150), 16, Color(0.55, 1.0, 0.7))
+	objective_label.size = Vector2(1000, 24)
+	objective_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	objective_label.visible = false
 
 	lbl_time = _hud_label("", Vector2(1140, 14), 14, COL_DIM)
 	lbl_time.size = Vector2(120, 22)
@@ -7445,6 +7727,12 @@ func _coop_clear_world() -> void:
 	remote_players.clear()
 	cl_designs.clear()
 	_clear_emotes()
+	for f in friendlies:
+		if f != null and f.node != null:
+			f.node.queue_free()
+	friendlies.clear()
+	cl_friendlies.clear()
+	_apply_objective("")
 	enemies.clear()
 	p_bullets.clear()
 	e_bullets.clear()
