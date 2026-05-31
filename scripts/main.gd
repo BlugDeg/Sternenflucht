@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.2"
+const GAME_VERSION := "0.3.3"
 
 
 # Arena (in world units)
@@ -96,6 +96,7 @@ class Entity:
 	var node: Node3D = null   # the visual MeshInstance3D / Node3D in the scene
 	# Multiplayer fields
 	var net_id: int = 0       # server-assigned network id (0 = local/single-player)
+	var is_mega: bool = false # enemy: special hidden mega-boss world event (radar marker + big reward)
 	var dna: Dictionary = {}  # enemy: procedural recipe, sent to clients so they rebuild the mesh
 	var owner_id: int = 0     # player bullet: peer id of the player who fired it
 	var tpos: Vector3 = Vector3.ZERO  # client: target position from the latest snapshot (lerp toward)
@@ -162,9 +163,11 @@ class RadarPanel extends Control:
 	var world_range: float = 80.0
 	var sweep_angle: float = 0.0
 	var sweep_speed: float = TAU / 3.2  # one revolution per ~3.2s
+	var t_accum: float = 0.0            # free-running clock for the mega-event pulse
 
 	func _process(delta: float) -> void:
 		sweep_angle = fmod(sweep_angle + delta * sweep_speed, TAU)
+		t_accum += delta
 		queue_redraw()
 
 	# Soft round glow — three stacked circles of decreasing radius / increasing alpha
@@ -275,6 +278,22 @@ class RadarPanel extends Control:
 				continue
 			var dxy2: Vector3 = e.pos - p_pos
 			var d: float = dxy2.length()
+			if e.is_mega:
+				# Hidden mega-boss event: shown only within ~MEGA_DETECT (220 units).
+				if d <= 220.0:
+					var puls: float = 0.55 + 0.45 * sin(t_accum * 5.0)
+					var mcol := Color(1.0, 0.35, 0.18)
+					if d <= world_range:
+						var mp := Vector2(r + dxy2.x * scale_factor, r - dxy2.y * scale_factor)
+						draw_arc(mp, 8.0 + puls * 4.0, 0.0, TAU, 28, Color(1.0, 0.45, 0.2, 0.9), 2.0)
+						_draw_blip(mp, mcol, 5.0, 0.85 + puls)
+					else:
+						var dir_m := Vector2(dxy2.x, -dxy2.y).normalized()
+						var at_m := c + dir_m * (r - 5.0)
+						_draw_blip(at_m, mcol, 4.2, 0.5 + puls)
+						var perp := Vector2(-dir_m.y, dir_m.x)
+						draw_polygon(PackedVector2Array([at_m + dir_m * 7.0, at_m - dir_m * 3.0 + perp * 4.0, at_m - dir_m * 3.0 - perp * 4.0]), PackedColorArray([Color(1.0, 0.55, 0.25, 0.95)]))
+				continue
 			var col: Color
 			var sz: float = 3.0
 			match e.type:
@@ -553,6 +572,12 @@ var chat_log_label: Label = null
 var chat_input: LineEdit = null
 var chat_typing: bool = false              # input focused → movement/fire/wheel suppressed
 var chat_messages: Array = []              # formatted "Name: text" history
+
+# --- World events (server + single-player authority) ---
+var mega_active = null                     # Entity ref of the live mega-boss (null = none)
+var mega_timer: float = 45.0               # countdown to the next mega event
+var announce_label: Label = null           # transient centre-top HUD banner
+var announce_timer: float = 0.0
 var home_probing: bool = false          # a lightweight reachability probe is in flight
 var probe_timer: float = 0.0            # connection timeout, shrinks once connected
 var home_ship_spin: float = 0.0         # turntable angle for the showcased ship
@@ -659,6 +684,8 @@ func _on_peer_disconnected(id: int) -> void:
 		p_bullets.clear()
 		e_bullets.clear()
 		gems.clear()
+		mega_active = null
+		mega_timer = randf_range(MEGA_INTERVAL_MIN, MEGA_INTERVAL_MAX)
 	print("[MP] Spieler getrennt: %d  (online: %d)" % [id, net_states.size()])
 	_broadcast_roster()
 
@@ -689,6 +716,7 @@ func _server_sim(delta: float) -> void:
 	_server_update_gems(delta)
 	_server_update_spawning(delta)
 	_server_update_waves(delta)
+	_update_events(delta)
 	_server_resolve_collisions()
 	_purge_dead()
 
@@ -720,7 +748,10 @@ func _server_update_enemies(delta: float) -> void:
 			"tank":
 				_ai_chase(e, delta, 2.8, tgt)
 			"boss":
-				_ai_boss(e, delta, tgt)
+				if e.is_mega and tgt.distance_to(e.pos) > MEGA_WAKE:
+					e.vel = e.vel.lerp(Vector3.ZERO, clamp(delta * 2.0, 0.0, 1.0))   # lurk until found
+				else:
+					_ai_boss(e, delta, tgt)
 		e.pos += e.vel * delta
 
 # Move + expire only (no arena cull — that uses the local player's position which
@@ -1333,6 +1364,7 @@ func spawn_enemy(net_id: int, dna: Dictionary, pos: Vector3) -> void:
 	var e := Entity.new()
 	e.type = dna.get("role", "drone")
 	e.net_id = net_id
+	e.is_mega = dna.get("mega", false)   # radar marker + reward cue on clients
 	e.pos = pos
 	e.tpos = pos
 	e.node = _build_procedural_enemy(dna)
@@ -1949,6 +1981,7 @@ func _process(delta: float) -> void:
 		_update_fire(delta)
 		_update_spawning(delta)
 		_update_wave(delta)
+		_update_events(delta)
 		_resolve_collisions()
 		_purge_dead()
 		_check_lightning_strikes(delta)
@@ -3693,7 +3726,10 @@ func _update_enemies(delta: float) -> void:
 			"tank":
 				_ai_chase(e, delta, 2.8, p_pos)
 			"boss":
-				_ai_boss(e, delta, p_pos)
+				if e.is_mega and p_pos.distance_to(e.pos) > MEGA_WAKE:
+					e.vel = e.vel.lerp(Vector3.ZERO, clamp(delta * 2.0, 0.0, 1.0))   # lurk until found
+				else:
+					_ai_boss(e, delta, p_pos)
 		e.pos += e.vel * delta
 		_clamp_to_arena(e)
 		if e.node != null:
@@ -3859,7 +3895,7 @@ func _ring_pos(radius: float) -> Vector3:
 	var ang: float = randf() * TAU
 	return p_pos + Vector3(cos(ang), sin(ang), 0) * radius
 
-func _spawn_enemy(kind: String, pos: Vector3, wave_n: int = -1) -> void:
+func _spawn_enemy(kind: String, pos: Vector3, wave_n: int = -1, mega: bool = false) -> Entity:
 	var e := Entity.new()
 	e.type = kind
 	e.pos = pos
@@ -3869,6 +3905,12 @@ func _spawn_enemy(kind: String, pos: Vector3, wave_n: int = -1) -> void:
 	# Generate procedural DNA — gives variety even within same role
 	var dna := _generate_enemy_dna(kind, wn)
 	var size: float = dna["size_mult"]
+	# Mega-boss event: blow up the DNA size first so the mesh (built from size_mult
+	# on clients too) comes out 5x; the `mega` flag rides along in the DNA.
+	if mega:
+		dna["mega"] = true
+		dna["size_mult"] = size * MEGA_SCALE
+		size = dna["size_mult"]
 	match kind:
 		"drone":
 			e.hp = int(round(2 * wave_scale)); e.max_hp = e.hp
@@ -3884,6 +3926,12 @@ func _spawn_enemy(kind: String, pos: Vector3, wave_n: int = -1) -> void:
 			e.hp = int(round(150 + wn * 25)); e.max_hp = e.hp
 			e.radius = 1.5 * size / 1.7; e.damage = 25; e.value = 50
 			e.shoot_cd = 1.0; e.shoot_timer = 1.0
+	# Mega-boss stat overrides (radius already 5x via the scaled size above).
+	if mega:
+		e.is_mega = true
+		e.hp = e.hp * int(MEGA_SCALE); e.max_hp = e.hp
+		e.damage = maxi(e.damage, 55)
+		e.shoot_cd = 0.8
 	e.dna = dna
 	# Server: headless authority — assign a network id and tell clients to build
 	# the mesh from the DNA, but build nothing locally.
@@ -3891,7 +3939,7 @@ func _spawn_enemy(kind: String, pos: Vector3, wave_n: int = -1) -> void:
 		e.net_id = _next_net_id()
 		enemies.append(e)
 		spawn_enemy.rpc(e.net_id, dna, pos)
-		return
+		return e
 	e.node = _build_procedural_enemy(dna)
 	e.node.position = pos
 	world.add_child(e.node)
@@ -3907,6 +3955,7 @@ func _spawn_enemy(kind: String, pos: Vector3, wave_n: int = -1) -> void:
 		e.node.add_child(hum)
 		hum.play()
 	enemies.append(e)
+	return e
 
 func _spawn_boss_wave() -> void:
 	var radius: float = SPAWN_RING * u_range_mult * 0.6
@@ -3923,6 +3972,68 @@ func _spawn_boss_wave() -> void:
 		_spawn_enemy("boss", center + Vector3(cos(ang), sin(ang), 0) * radius)
 	else:
 		_spawn_enemy("boss", _ring_pos(radius))
+
+# ============================================================
+# World events (server + single-player authority). Clients receive the mega-boss
+# through the normal enemy sync, so only the authority drives the cadence.
+# ============================================================
+func _update_events(delta: float) -> void:
+	if net_mode == NetMode.CLIENT:
+		return
+	# A mega-boss event runs until its entity dies, then a new countdown starts.
+	if mega_active != null:
+		if mega_active.dead:
+			mega_active = null
+			mega_timer = randf_range(MEGA_INTERVAL_MIN, MEGA_INTERVAL_MAX)
+		return
+	mega_timer -= delta
+	if mega_timer > 0.0:
+		return
+	mega_timer = randf_range(MEGA_INTERVAL_MIN, MEGA_INTERVAL_MAX)
+	# Eligible centre (a high-enough-level player) + its wave for scaling.
+	var center: Vector3
+	var wn: int
+	if net_mode == NetMode.SERVER:
+		var ids: Array = []
+		for id in net_states:
+			if not net_states[id].get("busy", false) and int(net_states[id].get("level", 1)) >= MEGA_MIN_LEVEL:
+				ids.append(id)
+		if ids.is_empty():
+			return
+		var pid: int = ids[randi() % ids.size()]
+		center = net_states[pid]["pos"]
+		wn = int(net_states[pid].get("wave", 1))
+	else:
+		if p_level < MEGA_MIN_LEVEL:
+			return
+		center = p_pos
+		wn = wave
+	# Hide it far away in a random direction — well beyond radar range, so the
+	# player has to track it down via the radar marker.
+	var ang: float = randf() * TAU
+	var pos: Vector3 = center + Vector3(cos(ang), sin(ang), 0) * randf_range(MEGA_SPAWN_MIN, MEGA_SPAWN_MAX)
+	mega_active = _spawn_enemy("boss", pos, wn, true)
+	_event_announce("⚠ ANOMALIE GEORTET — ein gewaltiger Gegner lauert in der Nähe. Folge dem Radar!")
+
+# Show a transient banner: broadcast from the server, local on single-player.
+func _event_announce(text: String) -> void:
+	if net_mode == NetMode.SERVER:
+		announce_event.rpc(text)
+	else:
+		_show_announce(text)
+
+@rpc("authority", "call_remote", "reliable")
+func announce_event(text: String) -> void:
+	if net_mode != NetMode.CLIENT or home_probing:
+		return
+	_show_announce(text)
+
+func _show_announce(text: String) -> void:
+	if announce_label == null:
+		return
+	announce_label.text = text
+	announce_label.visible = true
+	announce_timer = 6.0
 
 func _make_enemy_mesh(kind: String) -> Node3D:
 	var root := Node3D.new()
@@ -4438,6 +4549,21 @@ const EMOTE_OFFSET := Vector3(0, 1.3, 2.0)  # above + toward camera, in world un
 const CHAT_MAX_LINES := 8                   # messages shown in the log
 const CHAT_HISTORY := 30                    # messages kept
 const CHAT_MAX_LEN := 120
+
+# ============================================================
+# World events — hidden, procedurally-placed encounters found via the radar.
+# First type: the Mega-Boss (B), a 5x boss that lurks far away until reached.
+# Implemented as a flagged enemy so it reuses the whole enemy net/spawn pipeline.
+# ============================================================
+const MEGA_MIN_LEVEL := 6                   # party level before mega events can appear
+const MEGA_INTERVAL_MIN := 80.0             # seconds between mega events
+const MEGA_INTERVAL_MAX := 150.0
+const MEGA_SPAWN_MIN := 110.0               # how far from a player it hides (well beyond radar)
+const MEGA_SPAWN_MAX := 165.0
+const MEGA_DETECT := 220.0                  # radar reveals it within this range (hidden beyond)
+const MEGA_WAKE := 75.0                     # stays dormant until a player is this close
+const MEGA_SCALE := 5.0                     # 5x size/HP vs a normal boss
+const MEGA_GEMS := 40                       # loot shower on kill
 
 func _make_proc_hull_mat(c: Color) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
@@ -5230,6 +5356,9 @@ func _kill_enemy(e: Entity, killer_id: int = -1) -> void:
 		gem_count = 4
 	elif e.type == "boss":
 		gem_count = 12
+	if e.is_mega:
+		gem_count = MEGA_GEMS   # big loot shower for the hidden event
+		_event_announce("💥 MEGA-BOSS BESIEGT — riesige Beute!")
 	for i in gem_count:
 		_spawn_gem(e.pos + Vector3(randf_range(-0.4, 0.4), randf_range(-0.4, 0.4), 0), e.value)
 	if net_mode == NetMode.SERVER:
@@ -5977,6 +6106,8 @@ func _restart_run() -> void:
 	p_bullets.clear()
 	e_bullets.clear()
 	gems.clear()
+	mega_active = null
+	mega_timer = randf_range(MEGA_INTERVAL_MIN, MEGA_INTERVAL_MAX)
 	_reset_player_progression()
 	p_pos = Vector3.ZERO
 	wave = 1
@@ -6246,6 +6377,12 @@ func _build_hud() -> void:
 	lbl_wave = _hud_label("", Vector2(560, 14), 20, COL_TEXT)
 	lbl_wave.size = Vector2(160, 28)
 	lbl_wave.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+
+	# Transient event banner (centre-top) — shown by _show_announce.
+	announce_label = _hud_label("", Vector2(140, 120), 19, Color(1.0, 0.82, 0.4))
+	announce_label.size = Vector2(1000, 28)
+	announce_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	announce_label.visible = false
 
 	lbl_time = _hud_label("", Vector2(1140, 14), 14, COL_DIM)
 	lbl_time.size = Vector2(120, 22)
@@ -7055,6 +7192,10 @@ func _build_social_ui() -> void:
 func _update_social(delta: float) -> void:
 	_update_emotes(delta)
 	_update_emote_wheel()
+	if announce_timer > 0.0:
+		announce_timer -= delta
+		if announce_timer <= 0.0 and announce_label != null:
+			announce_label.visible = false
 
 # ---- Emote wheel selection ----
 func _update_emote_wheel() -> void:
