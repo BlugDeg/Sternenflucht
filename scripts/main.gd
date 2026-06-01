@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.3.13"
+const GAME_VERSION := "0.4.0"
 
 
 # Arena (in world units)
@@ -530,6 +530,14 @@ var mat_gem: StandardMaterial3D
 # UI
 var hud: CanvasLayer
 var hud_game: Control = null   # container for all gameplay HUD; hidden on the home screen
+# Touch controls (mobile web). Shown only on a touchscreen, or forced on with the
+# --touch launch arg for desktop testing. The virtual joystick feeds the same `dir`
+# vector as WASD; autofire is cone-based, so one stick drives move + aim + fire.
+var touch_root: Control = null
+var touch_joystick: VirtualJoystick = null
+var touch_boost: bool = false        # boost button currently held
+var touch_ui_on: bool = false        # a touchscreen is present (or --touch forced it)
+var touch_force: bool = false        # --touch launch arg
 var lbl_hp: Label
 var lbl_xp: Label
 var lbl_wave: Label
@@ -700,7 +708,7 @@ func _ready() -> void:
 	p_hp = p_max_hp
 	_build_updater_ui()
 	# Only check for updates from a real exported build (skip editor & server).
-	if not OS.has_feature("editor") and not OS.has_feature("dedicated_server"):
+	if not OS.has_feature("editor") and not OS.has_feature("dedicated_server") and not _is_web():
 		_check_for_updates()
 	# Both the double-click launch and the co-op .bat now land on the start screen
 	# first. A --connect launch just pre-selects co-op and remembers the address.
@@ -730,6 +738,14 @@ func _parse_net_mode() -> void:
 		elif a.begins_with("--connect="):
 			net_mode = NetMode.CLIENT
 			net_server_ip = a.substr("--connect=".length())
+		elif a == "--touch":
+			touch_force = true   # force the on-screen touch UI on desktop for testing
+
+# True only in an exported HTML5/Web build (browser/WASM). The Web build runs the
+# Compatibility renderer, so we skip Forward+-only effects (SSR/SSAO/4-split
+# shadows) and disable the desktop self-updater (no process/exe APIs in a browser).
+func _is_web() -> bool:
+	return OS.has_feature("web")
 
 # ============================================================
 # Networking — server (authoritative, headless)
@@ -737,8 +753,12 @@ func _parse_net_mode() -> void:
 
 func _start_dedicated_server() -> void:
 	randomize()
-	var peer := ENetMultiplayerPeer.new()
-	var err := peer.create_server(NET_PORT, NET_MAX_CLIENTS)
+	# WebSocket transport (browsers can't do ENet/UDP). Plain ws:// on localhost —
+	# TLS (wss://) is terminated upstream by the Cloudflare tunnel / Node gateway,
+	# which proxies the WebSocket upgrade to this port. The high-level @rpc layer
+	# is transport-agnostic, so nothing else in the netcode changes.
+	var peer := WebSocketMultiplayerPeer.new()
+	var err := peer.create_server(NET_PORT)
 	if err != OK:
 		push_error("[MP] create_server fehlgeschlagen: %d" % err)
 		return
@@ -1445,25 +1465,30 @@ func _sanitize_name(pname: String) -> String:
 # ============================================================
 
 func _start_client() -> void:
-	# The server may be given as a hostname (e.g. the nginx-proxied domain
-	# sternenflucht.it-en.ch) — ENet needs a numeric IP, so resolve it first.
-	var addr := net_server_ip
-	if not addr.is_valid_ip_address():
-		var resolved := IP.resolve_hostname(addr, IP.TYPE_IPV4)
-		if resolved.is_empty():
-			resolved = IP.resolve_hostname(addr, IP.TYPE_ANY)
-		if not resolved.is_empty():
-			print("[MP] %s -> %s" % [addr, resolved])
-			addr = resolved
-		else:
-			push_error("[MP] Konnte Hostname nicht aufloesen: %s" % addr)
-	var peer := ENetMultiplayerPeer.new()
-	var err := peer.create_client(addr, NET_PORT)
+	# WebSocket transport: the client connects to a URL (browsers can't do ENet/UDP,
+	# and desktop now shares the same WS server). See _build_ws_url for the shapes.
+	var url := _build_ws_url(net_server_ip)
+	var peer := WebSocketMultiplayerPeer.new()
+	var err := peer.create_client(url)
 	if err != OK:
 		push_error("[MP] create_client fehlgeschlagen: %d" % err)
 		return
 	multiplayer.multiplayer_peer = peer
-	print("[MP] Verbinde zu %s:%d ..." % [addr, NET_PORT])
+	print("[MP] Verbinde zu %s ..." % url)
+
+# Turn a server address into a WebSocket URL. Accepts an explicit ws://|wss:// URL
+# (used verbatim), a bare LAN IP / localhost (→ plain ws://<host>:<port> for dev /
+# same-LAN), or a public hostname like sternenflucht.it-en.ch (→ wss://<host>/ws,
+# which Cloudflare + the Node gateway terminate and proxy to the game port).
+func _build_ws_url(server: String) -> String:
+	var s := server.strip_edges()
+	if s.begins_with("ws://") or s.begins_with("wss://"):
+		return s
+	if s.is_empty():
+		s = DEFAULT_SERVER
+	if s.is_valid_ip_address() or s == "localhost":
+		return "ws://%s:%d" % [s, NET_PORT]
+	return "wss://%s/ws" % s
 
 # Connect the client multiplayer signals exactly once (the home-screen probe and a
 # real co-op join both call _start_client, and signals live on the MultiplayerAPI,
@@ -2437,14 +2462,17 @@ func _build_environment() -> void:
 	env.tonemap_mode = Environment.TONE_MAPPER_ACES
 	env.tonemap_exposure = 1.0
 	env.tonemap_white = 6.5
-	env.ssao_enabled = true
-	env.ssao_radius = 0.7
-	env.ssao_intensity = 1.8
-	env.ssao_detail = 1.2
-	env.ssr_enabled = true
-	env.ssr_max_steps = 64
-	env.ssr_fade_in = 0.15
-	env.ssr_fade_out = 2.0
+	# SSAO + SSR are Forward+/Mobile-only — the Web build's Compatibility renderer
+	# can't do them (it would just log warnings), so skip them there.
+	if not _is_web():
+		env.ssao_enabled = true
+		env.ssao_radius = 0.7
+		env.ssao_intensity = 1.8
+		env.ssao_detail = 1.2
+		env.ssr_enabled = true
+		env.ssr_max_steps = 64
+		env.ssr_fade_in = 0.15
+		env.ssr_fade_out = 2.0
 	# Subtle adjustments: a hint of vignette and warmer tint
 	env.adjustment_enabled = true
 	env.adjustment_brightness = 1.02
@@ -2482,7 +2510,8 @@ func _build_lights() -> void:
 	key.shadow_bias = 0.05
 	key.shadow_normal_bias = 1.2
 	key.shadow_blur = 1.0
-	key.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
+	# 4 cascades are heavy on WebGL2 — drop to 2 on the Web build.
+	key.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_2_SPLITS if _is_web() else DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
 	key.directional_shadow_max_distance = 80.0
 	add_child(key)
 	# Cold deep-space fill from below — prevents pure-black shadow side.
@@ -4000,6 +4029,11 @@ func _update_player(delta: float) -> void:
 		if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN):  dir.y -= 1
 		if Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT):  dir.x -= 1
 		if Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT): dir.x += 1
+		# Virtual joystick (touch) adds into the same direction vector. Cone autofire
+		# means this one stick also aims and triggers the guns — no fire button needed.
+		if touch_ui_on and touch_joystick != null:
+			dir.x += touch_joystick.value.x
+			dir.y += touch_joystick.value.y
 	var input_active: float = clamp(dir.length(), 0.0, 1.0)
 	if dir.length_squared() > 0.0:
 		dir = dir.normalized()
@@ -4009,7 +4043,7 @@ func _update_player(delta: float) -> void:
 	# `boost_depleted` latches when the tank runs dry mid-boost so the player
 	# can't stutter-boost off the recharge by simply holding Shift; they must
 	# release and re-press once charge has built back up.
-	var shift_held: bool = Input.is_key_pressed(KEY_SHIFT) and not chat_typing
+	var shift_held: bool = (Input.is_key_pressed(KEY_SHIFT) or touch_boost) and not chat_typing
 	if not shift_held:
 		boost_depleted = false
 	var want_boost: bool = shift_held and input_active > 0.0 and not boost_depleted
@@ -7316,6 +7350,55 @@ func _animate_background(delta: float) -> void:
 # HUD
 # ============================================================
 
+# On-screen analog stick for touch play. `value` is in GAME-dir convention
+# (x = right, y = up), magnitude 0..1. Tracks one pointer by finger index for real
+# multitouch (so you can hold boost with another finger), and also accepts the
+# mouse so it can be driven on desktop with the --touch flag.
+class VirtualJoystick extends Control:
+	var value: Vector2 = Vector2.ZERO
+	var _ptr: int = -99            # active pointer: touch index, or -1 = mouse, -99 = none
+	var _center: Vector2 = Vector2.ZERO
+	var radius: float = 110.0
+
+	func _ready() -> void:
+		_center = size * 0.5
+
+	func _draw() -> void:
+		draw_circle(_center, radius, Color(0.5, 0.7, 1.0, 0.16))
+		draw_arc(_center, radius, 0.0, TAU, 48, Color(0.6, 0.82, 1.0, 0.45), 2.0, true)
+		var knob: Vector2 = _center + Vector2(value.x, -value.y) * radius
+		draw_circle(knob, 36.0, Color(0.6, 0.92, 1.0, 0.85))
+
+	func _gui_input(event: InputEvent) -> void:
+		if event is InputEventScreenTouch:
+			if event.pressed and _ptr == -99:
+				_ptr = event.index
+				_drag_to(event.position)
+			elif not event.pressed and event.index == _ptr:
+				_release()
+		elif event is InputEventScreenDrag and event.index == _ptr:
+			_drag_to(event.position)
+		elif event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
+			if event.pressed and _ptr == -99:
+				_ptr = -1
+				_drag_to(event.position)
+			elif not event.pressed and _ptr == -1:
+				_release()
+		elif event is InputEventMouseMotion and _ptr == -1:
+			_drag_to(event.position)
+
+	func _drag_to(pos: Vector2) -> void:
+		var off: Vector2 = pos - _center
+		if off.length() > radius:
+			off = off.normalized() * radius
+		value = Vector2(off.x / radius, -off.y / radius)   # screen y-down → game y-up
+		queue_redraw()
+
+	func _release() -> void:
+		_ptr = -99
+		value = Vector2.ZERO
+		queue_redraw()
+
 func _build_hud() -> void:
 	hud = CanvasLayer.new()
 	add_child(hud)
@@ -7372,6 +7455,8 @@ func _build_hud() -> void:
 	radar.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	hud_game.add_child(radar)
 
+	_build_touch_controls()
+
 func _hud_label(text: String, pos: Vector2, size: int, col: Color) -> Label:
 	var l := Label.new()
 	l.text = text
@@ -7389,6 +7474,74 @@ func _hud_rect(pos: Vector2, size: Vector2, col: Color) -> ColorRect:
 	r.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	hud_game.add_child(r)
 	return r
+
+# Build the mobile touch overlay: a virtual stick (bottom-left) plus boost / pause /
+# emote / chat buttons. Added to `hud` before the menu panels so menus draw on top;
+# it stays hidden unless a touchscreen is present (or --touch forces it) AND we are
+# actively flying (see _update_touch_ui).
+func _build_touch_controls() -> void:
+	# On web, ?touch=1 in the URL forces the overlay on (debug aid for testing on a
+	# desktop browser, where is_touchscreen_available() is false).
+	if _is_web() and not touch_force:
+		var q: Variant = JavaScriptBridge.eval("location.search")
+		if q is String and "touch=1" in q:
+			touch_force = true
+	touch_ui_on = DisplayServer.is_touchscreen_available() or touch_force
+	touch_root = Control.new()
+	touch_root.size = Vector2(1280, 720)
+	touch_root.mouse_filter = Control.MOUSE_FILTER_IGNORE   # pass-through; widgets below capture
+	touch_root.visible = false
+	hud.add_child(touch_root)
+
+	touch_joystick = VirtualJoystick.new()
+	touch_joystick.size = Vector2(300, 300)
+	touch_joystick.position = Vector2(40, 720 - 300 - 30)
+	touch_joystick.mouse_filter = Control.MOUSE_FILTER_STOP
+	touch_root.add_child(touch_joystick)
+
+	# Boost — hold to thrust (bottom-right).
+	var boost_btn := _touch_button("BOOST", Vector2(1280 - 160 - 40, 720 - 160 - 30), Vector2(160, 160), 26)
+	boost_btn.button_down.connect(_touch_boost_on)
+	boost_btn.button_up.connect(_touch_boost_off)
+
+	# Pause (top-right).
+	var pause_btn := _touch_button("II", Vector2(1280 - 64 - 18, 16), Vector2(64, 52), 22)
+	pause_btn.pressed.connect(_toggle_esc_menu)
+
+	# Emote + chat, stacked just above the boost button.
+	var emote_btn := _touch_button("EMOTE", Vector2(1280 - 160 - 40, 720 - 160 - 30 - 70), Vector2(76, 58), 17)
+	emote_btn.pressed.connect(_touch_emote)
+	var chat_btn := _touch_button("CHAT", Vector2(1280 - 76 - 40, 720 - 160 - 30 - 70), Vector2(76, 58), 17)
+	chat_btn.pressed.connect(_open_chat)
+
+func _touch_button(text: String, pos: Vector2, sz: Vector2, fontsz: int) -> Button:
+	var b := Button.new()
+	b.text = text
+	b.position = pos
+	b.size = sz
+	b.focus_mode = Control.FOCUS_NONE
+	b.add_theme_font_size_override("font_size", fontsz)
+	b.modulate = Color(1.0, 1.0, 1.0, 0.82)
+	touch_root.add_child(b)
+	return b
+
+func _touch_boost_on() -> void:
+	touch_boost = true
+
+func _touch_boost_off() -> void:
+	touch_boost = false
+
+# Touch emote button fires a quick friendly emote (the full ALT+mouse wheel stays
+# desktop-only). Reuses the same RPC path as the wheel.
+func _touch_emote() -> void:
+	_fire_emote(0)
+
+# Show the touch overlay only while actively flying — hidden on the home screen,
+# in menus, and while typing in chat (so the stick never covers the keyboard).
+func _update_touch_ui() -> void:
+	if touch_root == null:
+		return
+	touch_root.visible = touch_ui_on and state == STATE_PLAYING and not menu_open and not chat_typing
 
 func _update_ui_text() -> void:
 	lbl_hp.text = "HÜLLE   %d / %d" % [max(0, p_hp), p_max_hp]
@@ -7412,6 +7565,7 @@ func _update_ui_text() -> void:
 		u_range_mult * 100.0, u_speed_mult * 100.0,
 		u_pierce, kills
 	]
+	_update_touch_ui()
 
 # ============================================================
 # Level-up panel
