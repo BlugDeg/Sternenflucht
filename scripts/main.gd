@@ -8,7 +8,7 @@ extends Node3D
 
 # Bumped on every release; the self-updater compares this against the
 # latest GitHub release tag (tags are "v" + this string, e.g. "v0.1.0").
-const GAME_VERSION := "0.4.0"
+const GAME_VERSION := "0.4.1"
 
 
 # Arena (in world units)
@@ -41,6 +41,12 @@ const SHIP_SCALE_BASE := 1.9
 const CAM_OFFSET_BASE := Vector3(0, -10.0, 13.0)
 const FIRE_CONE_DEG := 36.0  # half-angle of the cone in front of the ship within which auto-fire works
 const MAX_ENEMIES := 60
+
+# Web export runs the gl_compatibility (WebGL) renderer, where many dynamic real-time
+# lights are extremely expensive. Per-bullet/gem/heart OmniLights are skipped on web
+# (the objects still glow via their unshaded emissive materials + bloom). Desktop
+# (Forward+) keeps the full dynamic lighting. Computed once at load.
+var is_web: bool = OS.has_feature("web")
 
 # Wave
 const WAVE_DURATION := 28.0
@@ -652,6 +658,7 @@ var active_event: String = ""              # "", "mega", "escort" — one at a t
 var last_event_kind: String = ""           # last started event → alternate so neither dominates
 var event_timer: float = 45.0              # countdown to the next world event
 var mega_active = null                     # Entity ref of the live mega-boss
+var mega_timer: float = 0.0                # un-engaged mega despawns when this hits 0 (frozen while a player is near)
 var escort_bot = null                      # Entity (friendly) of the rescued pilot
 var escort_markers: Array = []             # Entity refs of the marked attacker enemies
 var escort_timer: float = 0.0              # rescue time limit countdown
@@ -4430,6 +4437,20 @@ func _update_events(delta: float) -> void:
 		"mega":
 			if mega_active == null or mega_active.dead:
 				_end_event()
+				return
+			# Un-engaged mega despawns after a while so it can't block the event
+			# rotation forever (it spawns far + dormant; if nobody hunts it, the
+			# 24/7 server would never run another event). The timer freezes while a
+			# player is within radar range — a mega that's being hunted stays put.
+			if _min_player_dist(mega_active.pos) <= MEGA_DETECT:
+				mega_timer = MEGA_TIME
+			else:
+				mega_timer -= delta
+				if mega_timer <= 0.0:
+					_despawn_enemy_entity(mega_active)
+					mega_active = null
+					_event_announce("… die Anomalie verschwindet wieder im Nichts.")
+					_end_event()
 			return
 		"escort":
 			_update_escort(delta)
@@ -4481,6 +4502,7 @@ func _start_mega(center: Vector3, wn: int, lvl: int) -> void:
 	var ang: float = randf() * TAU
 	var pos: Vector3 = center + Vector3(cos(ang), sin(ang), 0) * randf_range(MEGA_SPAWN_MIN, MEGA_SPAWN_MAX)
 	mega_active = _spawn_enemy("boss", pos, wn, true, lvl)
+	mega_timer = MEGA_TIME
 	active_event = "mega"
 	last_event_kind = "mega"
 	_event_announce("⚠ ANOMALIE GEORTET — ein gewaltiger Gegner lauert. Folge dem Radar!")
@@ -5402,6 +5424,9 @@ const MEGA_SPAWN_MIN := 110.0               # how far from a player it hides (we
 const MEGA_SPAWN_MAX := 165.0
 const MEGA_DETECT := 220.0                  # radar reveals it within this range (hidden beyond)
 const MEGA_WAKE := 75.0                     # stays dormant until a player is this close
+const MEGA_TIME := 240.0                    # un-engaged mega despawns after this (timer freezes
+                                            # while a player is within MEGA_DETECT) so an ignored
+                                            # mega never blocks the event rotation forever
 const MEGA_SCALE := 5.0                     # 5x size vs a normal boss (visual)
 const MEGA_HP_MULT := 60                    # HP vs a normal boss — high, since its huge
                                             # radius lets piercing shots multi-hit it hard
@@ -5961,7 +5986,8 @@ func _make_bullet_mesh(is_player: bool) -> Node3D:
 	root.add_child(halo)
 	# Enemy bullet light — small purple glow that illuminates the ship as it
 	# passes. Player bullets get their light in _make_player_laser_mesh.
-	if not is_player:
+	# Skipped on web (gl_compatibility): too many bullet lights melt WebGL.
+	if not is_player and not is_web:
 		var l := OmniLight3D.new()
 		l.light_color = COL_E_BULLET
 		l.light_energy = 1.8
@@ -6032,12 +6058,14 @@ func _make_player_laser_mesh(vel: Vector3) -> Node3D:
 
 	# Travelling point light — the bolt itself illuminates the ship and any
 	# nearby objects as it flies past. Small range to keep it cheap.
-	var l := OmniLight3D.new()
-	l.light_color = COL_LASER
-	l.light_energy = 2.4
-	l.omni_range = 4.5
-	l.omni_attenuation = 1.8
-	root.add_child(l)
+	# Skipped on web (gl_compatibility): too many bullet lights melt WebGL.
+	if not is_web:
+		var l := OmniLight3D.new()
+		l.light_color = COL_LASER
+		l.light_energy = 2.4
+		l.omni_range = 4.5
+		l.omni_attenuation = 1.8
+		root.add_child(l)
 
 	# CapsuleMesh extends along the Y axis. Rotate around Z so +Y aligns with
 	# the velocity direction in the XY play plane.
@@ -6079,13 +6107,15 @@ func _make_gem_mesh() -> Node3D:
 	inst2.rotation_degrees = Vector3(0, 0, 180)
 	root.add_child(inst2)
 	# Gem light — small but very visible; piles of gems on the ground will
-	# collectively light the area around them.
-	var l := OmniLight3D.new()
-	l.light_color = COL_XP
-	l.light_energy = 1.4
-	l.omni_range = 3.2
-	l.omni_attenuation = 1.6
-	root.add_child(l)
+	# collectively light the area around them. Skipped on web (gl_compatibility):
+	# loot-shower gem piles (30-40 at once) would melt WebGL with that many lights.
+	if not is_web:
+		var l := OmniLight3D.new()
+		l.light_color = COL_XP
+		l.light_energy = 1.4
+		l.omni_range = 3.2
+		l.omni_attenuation = 1.6
+		root.add_child(l)
 	return root
 
 # Spawn a full-heal heart pickup at pos. On the headless server it's id-only (synced via
